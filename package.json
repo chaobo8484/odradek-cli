@@ -1,0 +1,52 @@
+{
+  "name": "aeris-cli",
+  "version": "1.0.0",
+  "description": "A CLI tool for analyzing, enhancing, and diagnosing Claude Code and agent workflows.",
+  "main": "./dist/index.js",
+  "bin": {
+    "aeris": "./dist/index.js"
+  },
+  "type": "module",
+  "files": [
+    "dist",
+    "README.md",
+    ".env.example"
+  ],
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "clean": "node -e \"const fs=require('node:fs');fs.rmSync('dist',{recursive:true,force:true})\"",
+    "prebuild": "npm run clean",
+    "build": "tsc",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "cli",
+    "agent",
+    "claude",
+    "workflow",
+    "analyzer"
+  ],
+  "author": "chaobo8484 from StratoSpheresLab",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chaobo8484/aeris-cli.git"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "boxen": "^7.1.1",
+    "chalk": "^5.3.0",
+    "commander": "^12.0.0",
+    "inquirer": "^9.2.15",
+    "ora": "^8.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.19",
+    "tsx": "^4.7.1",
+    "typescript": "^5.3.3"
+  }
+}
