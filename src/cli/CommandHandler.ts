@@ -12,6 +12,7 @@ import { PromptAssetCategory, PromptAssetScanner } from './PromptAssetScanner.js
 import { SkillScanner, SkillScanResult, SkillSummary } from './SkillScanner.js';
 import { ContextNoiseAnalysis, ContextNoiseAnalyzer, ContextNoiseReadRecord } from './ContextNoiseAnalyzer.js';
 import { TodoGranularityAnalysis, TodoGranularityAnalyzer } from './TodoGranularityAnalyzer.js';
+import { estimateTokenCount } from './tokenEstimate.js';
 import { ClaudeTokenizer } from '../llm/ClaudeTokenizer.js';
 
 type ContextAnatomySegmentKey = 'system' | 'prompt_library' | 'reference_docs' | 'chat_history' | 'active_request';
@@ -172,6 +173,16 @@ type PromptCoverageSummary = {
   scannedPromptFiles: number;
   scannedSkills: number;
   assetPathKeys: string[];
+};
+
+type PromptScanTokenizerMode = 'count_tokens' | 'messages_usage' | 'estimated';
+
+type PromptScanTokenCounter = (text: string) => Promise<number>;
+
+type PromptScanTokenizationStrategy = {
+  countTokens: PromptScanTokenCounter;
+  getMode: () => PromptScanTokenizerMode;
+  getWarning: () => string | undefined;
 };
 
 export class CommandHandler {
@@ -2612,14 +2623,19 @@ export class CommandHandler {
     }
 
     try {
-      const { mode, result, anatomyView } = await this.withTimeout(
+      const { mode, warning, result, anatomyView } = await this.withTimeout(
         async () => {
-          const mode = await this.claudeTokenizer.getActiveMode();
+          const tokenization = await this.resolvePromptScanTokenizationStrategy();
           const result = await this.promptAssetScanner.scan(process.cwd(), {
-            tokenCounter: (text, _filePath) => this.claudeTokenizer.countTextTokens(text),
+            tokenCounter: (text, _filePath) => tokenization.countTokens(text),
           });
-          const anatomyView = await this.buildContextAnatomyView(result.files);
-          return { mode, result, anatomyView };
+          const anatomyView = await this.buildContextAnatomyView(result.files, tokenization.countTokens);
+          return {
+            mode: tokenization.getMode(),
+            warning: tokenization.getWarning(),
+            result,
+            anatomyView,
+          };
         },
         CommandHandler.SCAN_PROMPT_TIMEOUT_MS,
         `/scan_prompt timed out after ${this.formatTimeoutMs(CommandHandler.SCAN_PROMPT_TIMEOUT_MS)}.`
@@ -2630,8 +2646,16 @@ export class CommandHandler {
         this.uiRenderer.renderSuccess('Prompt analysis completed');
       }
 
-      const modeLabel = mode === 'count_tokens' ? 'messages/count_tokens' : 'messages usage.input_tokens';
+      const modeLabel =
+        mode === 'count_tokens'
+          ? 'messages/count_tokens'
+          : mode === 'messages_usage'
+            ? 'messages usage.input_tokens'
+            : 'local estimated tokens';
       this.uiRenderer.renderInfo(`Tokenizer mode: ${modeLabel}`);
+      if (warning) {
+        this.uiRenderer.renderWarning(warning);
+      }
 
       console.log('');
       console.log(chalk.bold('  Prompt Asset Scan'));
@@ -2728,6 +2752,40 @@ export class CommandHandler {
           reject(error);
         });
     });
+  }
+
+  private async resolvePromptScanTokenizationStrategy(): Promise<PromptScanTokenizationStrategy> {
+    let mode: PromptScanTokenizerMode = 'estimated';
+    let warning: string | undefined;
+
+    try {
+      mode = await this.claudeTokenizer.getActiveMode();
+    } catch (error) {
+      warning = this.formatPromptScanTokenizerFallbackWarning(error);
+    }
+
+    return {
+      countTokens: async (text: string) => {
+        if (mode === 'estimated') {
+          return estimateTokenCount(text);
+        }
+
+        try {
+          return await this.claudeTokenizer.countTextTokens(text);
+        } catch (error) {
+          mode = 'estimated';
+          warning ??= this.formatPromptScanTokenizerFallbackWarning(error);
+          return estimateTokenCount(text);
+        }
+      },
+      getMode: () => mode,
+      getWarning: () => warning,
+    };
+  }
+
+  private formatPromptScanTokenizerFallbackWarning(error: unknown): string {
+    const message = error instanceof Error ? error.message : 'Unknown tokenizer error';
+    return `Tokenizer unavailable. Falling back to local token estimates. Reason: ${message}`;
   }
 
   private formatTimeoutMs(timeoutMs: number): string {
@@ -2841,7 +2899,8 @@ export class CommandHandler {
   }
 
   private async buildContextAnatomyView(
-    files: Array<{ relativePath: string; categories: PromptAssetCategory[]; tokenCount: number }>
+    files: Array<{ relativePath: string; categories: PromptAssetCategory[]; tokenCount: number }>,
+    countTokens: PromptScanTokenCounter
   ): Promise<ContextAnatomyView> {
     const systemFiles: Array<{ relativePath: string; categories: PromptAssetCategory[]; tokenCount: number }> = [];
     const promptLibraryFiles: Array<{ relativePath: string; categories: PromptAssetCategory[]; tokenCount: number }> = [];
@@ -2868,8 +2927,8 @@ export class CommandHandler {
     const latestUserMessage = [...messages].reverse().find((message) => message.role === 'user');
     const historyMessages = messages.filter((message) => message.id !== latestUserMessage?.id);
     const [userMessageTokens, historyTokenParts] = await Promise.all([
-      latestUserMessage ? this.claudeTokenizer.countTextTokens(latestUserMessage.content) : Promise.resolve(0),
-      Promise.all(historyMessages.map((message) => this.claudeTokenizer.countTextTokens(message.content))),
+      latestUserMessage ? countTokens(latestUserMessage.content) : Promise.resolve(0),
+      Promise.all(historyMessages.map((message) => countTokens(message.content))),
     ]);
     const historyTokens = historyTokenParts.reduce((sum, value) => sum + value, 0);
 

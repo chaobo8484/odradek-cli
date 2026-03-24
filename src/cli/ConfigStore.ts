@@ -18,7 +18,7 @@ export interface AppConfig {
   projectContextEnabled: boolean;
 }
 
-export type ConfigValueSource = 'env' | 'local' | 'default' | 'unset';
+export type ConfigValueSource = 'session' | 'env' | 'local' | 'default' | 'unset';
 
 export interface ProviderConfigSources {
   apiKey: ConfigValueSource;
@@ -44,6 +44,7 @@ const DEFAULT_CONFIG: AppConfig = {
 export class ConfigStore {
   private readonly configPath: string;
   private readonly appName = 'aeris-cli';
+  private readonly sessionProviderOverrides: Partial<Record<ProviderName, ProviderConfig>> = {};
 
   constructor() {
     this.configPath = this.resolveConfigPath();
@@ -51,7 +52,8 @@ export class ConfigStore {
 
   async getConfig(): Promise<AppConfig> {
     const stored = await this.getStoredConfig();
-    return this.applyEnvironmentOverrides(stored);
+    const withEnvironment = this.applyEnvironmentOverrides(stored);
+    return this.applySessionOverrides(withEnvironment);
   }
 
   async getStoredConfig(): Promise<AppConfig> {
@@ -80,6 +82,7 @@ export class ConfigStore {
 
   async getConfigDiagnostics(): Promise<ConfigDiagnostics> {
     const stored = await this.getStoredConfig();
+    const sessionProvider = this.getSessionProviderConfig('claude');
     const envProvider = this.getEnvironmentProviderConfig();
     const envProjectContextEnabled = this.readBooleanEnv(['AERIS_PROJECT_CONTEXT_ENABLED']);
     const storedProvider = stored.providers.claude ?? {};
@@ -88,9 +91,27 @@ export class ConfigStore {
       loadedEnvFiles: getLoadedEnvironmentFiles(),
       providerSources: {
         claude: {
-          apiKey: envProvider.apiKey ? 'env' : storedProvider.apiKey?.trim() ? 'local' : 'unset',
-          baseUrl: envProvider.baseUrl ? 'env' : storedProvider.baseUrl?.trim() ? 'local' : 'default',
-          model: envProvider.model ? 'env' : storedProvider.model?.trim() ? 'local' : 'default',
+          apiKey: sessionProvider.apiKey
+            ? 'session'
+            : envProvider.apiKey
+              ? 'env'
+              : storedProvider.apiKey?.trim()
+                ? 'local'
+                : 'unset',
+          baseUrl: sessionProvider.baseUrl
+            ? 'session'
+            : envProvider.baseUrl
+              ? 'env'
+              : storedProvider.baseUrl?.trim()
+                ? 'local'
+                : 'default',
+          model: sessionProvider.model
+            ? 'session'
+            : envProvider.model
+              ? 'env'
+              : storedProvider.model?.trim()
+                ? 'local'
+                : 'default',
         },
       },
       projectContextEnabledSource:
@@ -159,6 +180,44 @@ export class ConfigStore {
     return this.configPath;
   }
 
+  setSessionProviderConfig(provider: ProviderName, config: ProviderConfig): void {
+    const current = this.sessionProviderOverrides[provider] ?? {};
+    const next: ProviderConfig = {
+      ...current,
+      ...config,
+    };
+
+    if (!next.apiKey && !next.baseUrl && !next.model) {
+      delete this.sessionProviderOverrides[provider];
+      return;
+    }
+
+    this.sessionProviderOverrides[provider] = next;
+  }
+
+  clearSessionProviderConfig(provider: ProviderName, keys?: Array<keyof ProviderConfig>): void {
+    if (!this.sessionProviderOverrides[provider]) {
+      return;
+    }
+
+    if (!keys || keys.length === 0) {
+      delete this.sessionProviderOverrides[provider];
+      return;
+    }
+
+    const next: ProviderConfig = { ...(this.sessionProviderOverrides[provider] ?? {}) };
+    for (const key of keys) {
+      delete next[key];
+    }
+
+    if (!next.apiKey && !next.baseUrl && !next.model) {
+      delete this.sessionProviderOverrides[provider];
+      return;
+    }
+
+    this.sessionProviderOverrides[provider] = next;
+  }
+
   private async ensureConfigDir(): Promise<void> {
     const dir = path.dirname(this.configPath);
     await fs.mkdir(dir, { recursive: true });
@@ -189,12 +248,33 @@ export class ConfigStore {
     };
   }
 
+  private applySessionOverrides(config: AppConfig): AppConfig {
+    const sessionProvider = this.getSessionProviderConfig('claude');
+
+    return {
+      ...config,
+      providers: {
+        ...config.providers,
+        claude: {
+          ...config.providers.claude,
+          ...(sessionProvider.apiKey ? { apiKey: sessionProvider.apiKey } : {}),
+          ...(sessionProvider.baseUrl ? { baseUrl: sessionProvider.baseUrl } : {}),
+          ...(sessionProvider.model ? { model: sessionProvider.model } : {}),
+        },
+      },
+    };
+  }
+
   private getEnvironmentProviderConfig(): ProviderConfig {
     return {
       apiKey: this.readStringEnv(['AERIS_CLAUDE_API_KEY', 'ANTHROPIC_API_KEY']),
       baseUrl: this.readStringEnv(['AERIS_CLAUDE_BASE_URL', 'ANTHROPIC_BASE_URL']),
       model: this.readStringEnv(['AERIS_CLAUDE_MODEL']),
     };
+  }
+
+  private getSessionProviderConfig(provider: ProviderName): ProviderConfig {
+    return this.sessionProviderOverrides[provider] ?? {};
   }
 
   private readStringEnv(keys: string[]): string | undefined {

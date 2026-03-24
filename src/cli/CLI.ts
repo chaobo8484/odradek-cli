@@ -28,6 +28,7 @@ export class CLI {
   private lastInlineSuggestionQuery = '';
   private promptVisibleLines = 0;
   private readonly promptPrefix = '❯ ';
+  private readonly homeAccent = chalk.hex('#CC7D5E');
   private configStore: ConfigStore;
   private llmClient: LLMClient;
   private isInteractiveCommandActive = false;
@@ -152,14 +153,20 @@ export class CLI {
     this.promptVisibleLines = 0;
     console.log('');
     console.log(chalk.bold('  Aeris'));
-    console.log(chalk.dim('  Internal Build: v0.0.2_1'));
+    console.log(chalk.dim('  Internal Build: v0.0.2_3'));
     console.log('');
     await this.renderHomeConfigStatus();
     await this.renderHomeProjectContextStatus();
     await this.renderHomeTrustStatus();
     console.log('');
     console.log(chalk.dim('  Type a message to start chatting'));
-    console.log(chalk.dim('  Type ') + chalk.cyan('/') + chalk.dim(' for commands, press ') + chalk.cyan('Tab') + chalk.dim(' to autocomplete'));
+    console.log(
+      chalk.dim('  Type ') +
+        this.homeAccent('/') +
+        chalk.dim(' for commands, press ') +
+        this.homeAccent('Tab') +
+        chalk.dim(' to autocomplete')
+    );
     console.log('');
   }
 
@@ -175,9 +182,9 @@ export class CLI {
 
       if (apiKey && currentModel) {
         console.log(chalk.green('  Model Config: ready'));
-        console.log(chalk.dim('  Config source: ') + chalk.cyan(sourceSummary));
-        console.log(chalk.dim('  Current model: ') + chalk.cyan(currentModel));
-        console.log(chalk.dim('  Base URL: ') + chalk.cyan(currentBaseUrl));
+        console.log(chalk.dim('  Config source: ') + this.homeAccent(sourceSummary));
+        console.log(chalk.dim('  Current model: ') + this.homeAccent(currentModel));
+        console.log(chalk.dim('  Base URL: ') + this.homeAccent(currentBaseUrl));
         this.renderEnvironmentStatusLines(diagnostics);
         return;
       }
@@ -186,26 +193,26 @@ export class CLI {
       if (!apiKey) {
         console.log(
           chalk.dim('  Set ') +
-            chalk.cyan('AERIS_CLAUDE_API_KEY') +
+            this.homeAccent('AERIS_CLAUDE_API_KEY') +
             chalk.dim(' or run ') +
-            chalk.cyan('/modelconfig') +
+            this.homeAccent('/modelconfig') +
             chalk.dim(' to finish setup')
         );
       }
       if (!currentModel) {
         console.log(
           chalk.dim('  Set ') +
-            chalk.cyan('AERIS_CLAUDE_MODEL') +
+            this.homeAccent('AERIS_CLAUDE_MODEL') +
             chalk.dim(' or run ') +
-            chalk.cyan('/model <model-name>') +
+            this.homeAccent('/model <model-name>') +
             chalk.dim(' to finish setup')
         );
       }
-      console.log(chalk.dim('  Current Base URL: ') + chalk.cyan(currentBaseUrl));
+      console.log(chalk.dim('  Current Base URL: ') + this.homeAccent(currentBaseUrl));
       this.renderEnvironmentStatusLines(diagnostics);
     } catch {
       console.log(chalk.red('  Failed to read model configuration state'));
-      console.log(chalk.dim('  Run ') + chalk.cyan('/modelconfig') + chalk.dim(' to configure again'));
+      console.log(chalk.dim('  Run ') + this.homeAccent('/modelconfig') + chalk.dim(' to configure again'));
     }
   }
 
@@ -217,9 +224,9 @@ export class CLI {
       console.log(chalk.dim('  Project Context: ') + state);
       console.log(
         chalk.dim('  Toggle with ') +
-          chalk.cyan('/projectcontext on') +
+          this.homeAccent('/projectcontext on') +
           chalk.dim(' / ') +
-          chalk.cyan('/projectcontext off')
+          this.homeAccent('/projectcontext off')
       );
     } catch {
       console.log(chalk.red('  Project Context: failed to read config'));
@@ -299,9 +306,9 @@ export class CLI {
       const trusted = await this.configStore.isPathTrusted(currentPath);
       const status = trusted ? chalk.green('trusted') : chalk.yellow('not trusted');
       console.log(chalk.dim('  Trust Check: ') + status);
-      console.log(chalk.dim('  Current path: ') + chalk.cyan(currentPath));
+      console.log(chalk.dim('  Current path: ') + this.homeAccent(currentPath));
       if (!trusted) {
-        console.log(chalk.dim('  Run ') + chalk.cyan('/trustpath') + chalk.dim(' to trust this directory'));
+        console.log(chalk.dim('  Run ') + this.homeAccent('/trustpath') + chalk.dim(' to trust this directory'));
       }
     } catch {
       console.log(chalk.red('  Trust Check: failed'));
@@ -852,6 +859,7 @@ export class CLI {
     try {
       const invokedCommand = args.length > 0 ? `/model ${args.join(' ')}` : '/model';
       const config = await this.configStore.getConfig();
+      const diagnostics = await this.configStore.getConfigDiagnostics();
       const providerConfig = config.providers.claude ?? {};
       const apiKey = providerConfig.apiKey?.trim();
       if (!apiKey) {
@@ -864,14 +872,32 @@ export class CLI {
       }
 
       const currentBaseUrl = providerConfig.baseUrl?.trim() || CLAUDE_META.defaultBaseUrl;
-      const currentConfiguredModel = providerConfig.model?.trim();
-      const currentEffectiveModel = currentConfiguredModel || 'Not set';
+      const currentEffectiveModelValue = providerConfig.model?.trim() || '';
+      const currentEffectiveModel = currentEffectiveModelValue || 'Not set';
+      const isSessionModelOverrideActive = diagnostics.providerSources.claude.model === 'session';
       let targetModel: string | undefined;
 
       if (args.length > 0) {
         const rawInput = args.join(' ').trim();
         if (!rawInput) {
           await this.refreshHomeAfterModelCommand(invokedCommand, `Current model: ${currentEffectiveModel}`);
+          return;
+        }
+
+        const normalizedInput = rawInput.toLowerCase();
+        if (normalizedInput === 'clear' || normalizedInput === 'reset' || normalizedInput === 'default' || normalizedInput === 'unset') {
+          if (!isSessionModelOverrideActive) {
+            await this.refreshHomeAfterModelCommand(
+              invokedCommand,
+              `No session model override is active. Current model: ${currentEffectiveModel}`
+            );
+            return;
+          }
+
+          this.configStore.clearSessionProviderConfig('claude', ['model']);
+          const nextConfig = await this.configStore.getConfig();
+          const nextModel = nextConfig.providers.claude?.model?.trim() || 'Not set';
+          await this.refreshHomeAfterModelCommand(invokedCommand, `Session model cleared. Active model: ${nextModel}`);
           return;
         }
 
@@ -921,20 +947,21 @@ export class CLI {
         targetModel = selectedModel;
       }
 
-      const previousConfiguredModel = currentConfiguredModel;
       const previousEffectiveModel = currentEffectiveModel;
       const nextEffectiveModel = targetModel?.trim() || 'Not set';
-      const normalizedPreviousConfigured = previousConfiguredModel?.trim() || '';
       const normalizedTarget = targetModel?.trim() || '';
-      const isSameConfiguredValue = normalizedPreviousConfigured === normalizedTarget;
+      const isSameConfiguredValue = currentEffectiveModelValue === normalizedTarget;
 
       if (isSameConfiguredValue) {
         await this.refreshHomeAfterModelCommand(invokedCommand, `Model unchanged: ${previousEffectiveModel}`);
         return;
       }
 
-      await this.configStore.setProviderConfig('claude', { model: targetModel });
-      await this.refreshHomeAfterModelCommand(invokedCommand, `Model switched: ${previousEffectiveModel} -> ${nextEffectiveModel}`);
+      this.configStore.setSessionProviderConfig('claude', { model: targetModel });
+      await this.refreshHomeAfterModelCommand(
+        invokedCommand,
+        `Session model switched: ${previousEffectiveModel} -> ${nextEffectiveModel}`
+      );
     } catch (error) {
       if (this.isPromptCancelError(error)) {
         this.uiRenderer.renderCommandResult('Model switch canceled');
@@ -1164,7 +1191,9 @@ export class CLI {
       '',
       `${chalk.gray('Default Base URL:')} ${chalk.cyan(CLAUDE_META.defaultBaseUrl)}`,
       `${chalk.gray('Config File:')} ${chalk.dim(this.configStore.getConfigPath())}`,
-      `${chalk.gray('Environment Keys:')} ${chalk.dim('AERIS_CLAUDE_API_KEY, AERIS_CLAUDE_BASE_URL, AERIS_CLAUDE_MODEL')}`,
+      `${chalk.gray('Environment Keys:')} ${chalk.dim(
+        'AERIS_CLAUDE_API_KEY, AERIS_CLAUDE_BASE_URL, AERIS_CLAUDE_MODEL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL'
+      )}`,
       diagnostics.loadedEnvFiles.length > 0
         ? `${chalk.gray('Loaded Env Files:')} ${chalk.dim(diagnostics.loadedEnvFiles.join(', '))}`
         : `${chalk.gray('Loaded Env Files:')} ${chalk.dim('none detected')}`,
@@ -1213,22 +1242,26 @@ export class CLI {
   private renderEnvironmentStatusLines(diagnostics: ConfigDiagnostics): void {
     const providerSources = diagnostics.providerSources.claude;
     const envOverrides = this.getEnvironmentOverrideLabels(providerSources);
+    const sessionOverrides = this.getSessionOverrideLabels(providerSources);
 
     if (diagnostics.loadedEnvFiles.length > 0) {
-      console.log(chalk.dim('  Loaded env files: ') + chalk.cyan(diagnostics.loadedEnvFiles.join(', ')));
+      console.log(chalk.dim('  Loaded env files: ') + this.homeAccent(diagnostics.loadedEnvFiles.join(', ')));
     }
 
-    if (envOverrides.length === 0 && diagnostics.projectContextEnabledSource !== 'env') {
-      return;
+    if (envOverrides.length > 0 || diagnostics.projectContextEnabledSource === 'env') {
+      const segments = [...envOverrides];
+      if (diagnostics.projectContextEnabledSource === 'env') {
+        segments.push('Project Context');
+      }
+
+      console.log(chalk.yellow('  Environment override active: ') + chalk.white(segments.join(', ')));
+      console.log(chalk.dim('  Runtime values from process.env/.env take precedence over saved local config'));
     }
 
-    const segments = [...envOverrides];
-    if (diagnostics.projectContextEnabledSource === 'env') {
-      segments.push('Project Context');
+    if (sessionOverrides.length > 0) {
+      console.log(chalk.green('  Session override active: ') + chalk.white(sessionOverrides.join(', ')));
+      console.log(chalk.dim('  Use ') + this.homeAccent('/model clear') + chalk.dim(' to return to the configured default model'));
     }
-
-    console.log(chalk.yellow('  Environment override active: ') + chalk.white(segments.join(', ')));
-    console.log(chalk.dim('  Runtime values from process.env/.env take precedence over saved local config'));
   }
 
   private getEnvironmentOverrideLabels(sources: ProviderConfigSources): string[] {
@@ -1249,24 +1282,54 @@ export class CLI {
     return labels;
   }
 
-  private summarizeProviderConfigSource(sources: ProviderConfigSources): string {
-    const runtimeSources = new Set(
-      [sources.apiKey, sources.baseUrl, sources.model].filter((item) => item === 'env' || item === 'local')
-    );
+  private getSessionOverrideLabels(sources: ProviderConfigSources): string[] {
+    const labels: string[] = [];
 
-    if (runtimeSources.has('env') && runtimeSources.has('local')) {
-      return 'mixed (environment + local)';
+    if (sources.apiKey === 'session') {
+      labels.push('API Key');
     }
 
-    if (runtimeSources.has('env')) {
+    if (sources.baseUrl === 'session') {
+      labels.push('Base URL');
+    }
+
+    if (sources.model === 'session') {
+      labels.push('Model');
+    }
+
+    return labels;
+  }
+
+  private summarizeProviderConfigSource(sources: ProviderConfigSources): string {
+    const runtimeSources = Array.from(
+      new Set(
+        [sources.apiKey, sources.baseUrl, sources.model].filter(
+          (item) => item === 'session' || item === 'env' || item === 'local'
+        )
+      )
+    );
+
+    if (runtimeSources.length === 0) {
+      return 'not configured';
+    }
+
+    if (runtimeSources.length === 1) {
+      return this.describeRuntimeSource(runtimeSources[0]);
+    }
+
+    return `mixed (${runtimeSources.map((item) => this.describeRuntimeSource(item)).join(' + ')})`;
+  }
+
+  private describeRuntimeSource(source: 'session' | 'env' | 'local'): string {
+    if (source === 'session') {
+      return 'session override';
+    }
+
+    if (source === 'env') {
       return 'environment';
     }
 
-    if (runtimeSources.has('local')) {
-      return 'local config file';
-    }
-
-    return 'not configured';
+    return 'local config file';
   }
 
   private renderConfigSummary(config: ProviderConfig): void {

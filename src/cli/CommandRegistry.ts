@@ -23,8 +23,8 @@ export class CommandRegistry {
     this.register({ name: 'export', description: 'Export conversation history', usage: '/export [filename]' });
     this.register({
       name: 'model',
-      description: 'Switch the active API model',
-      usage: '/model [model-name]',
+      description: 'Switch the active API model for this CLI session',
+      usage: '/model [model-name|clear]',
     });
     this.register({
       name: 'trustpath',
