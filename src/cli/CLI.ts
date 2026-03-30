@@ -1,5 +1,8 @@
 ﻿import readline from 'readline';
+import fs from 'fs';
+import path from 'path';
 import chalk from 'chalk';
+import { fileURLToPath } from 'url';
 import inquirer from 'inquirer';
 import { render } from 'ink';
 import { createElement } from 'react';
@@ -17,7 +20,7 @@ import { LLMAdapter } from '../llm/adapters/types.js';
 import { TrustDecision, TrustPrompt } from './ink/TrustPrompt.js';
 
 export class CLI {
-  private rl: readline.Interface;
+  private static readonly EXIT_CONFIRM_WINDOW_MS = 3000;
   private conversationManager: ConversationManager;
   private commandHandler: CommandHandler;
   private uiRenderer: UIRenderer;
@@ -26,57 +29,127 @@ export class CLI {
   private inlineSuggestionLines = 0;
   private lastInlineSuggestionQuery = '';
   private promptVisibleLines = 0;
-  private readonly promptPrefix = '❯ ';
-  private readonly homeAccent = chalk.hex('#CC7D5E');
+  private inputValue = '';
+  private inputCursor = 0;
+  private inputHistory: string[] = [];
+  private historyIndex = -1;
+  private historyDraftValue = '';
+  private readonly promptPrefix = '> ';
+  private readonly promptPlaceholder = 'Type a message or / for commands';
+  private readonly homeAccent = chalk.hex('#D6F54A');
+  private readonly homePanelBorder = chalk.hex('#5E6575');
+  private readonly homeMuted = chalk.hex('#9299A8');
+  private readonly homeTitle = chalk.hex('#F5F7FA');
+  private readonly homeSuccess = chalk.hex('#8CE36B');
+  private readonly homeWarning = chalk.hex('#F0C35C');
+  private readonly homeDanger = chalk.hex('#FF7A72');
+  private readonly internalBuildVersion = this.readPackageVersion();
   private configStore: ConfigStore;
   private llmClient: LLMClient;
   private readonly adaptersByProvider: Map<ProviderName, LLMAdapter>;
   private isInteractiveCommandActive = false;
   private commandDataHistory: Array<{ timestamp: Date; command: string; data: string }> = [];
   private isLineProcessing = false;
-  private readonly onInputAssistKeypress = (_str: string, key: readline.Key): void => {
-    if (!this.canRenderInlineSuggestions()) {
+  private pendingExitConfirmationUntil = 0;
+  private pendingExitConfirmationTimer: ReturnType<typeof setTimeout> | null = null;
+  private exitConfirmationNoticeVisible = false;
+  private readonly onInputAssistKeypress = (str: string, key: readline.Key): void => {
+    if (!(key.ctrl && key.name === 'c') && this.hasPendingExitConfirmation()) {
+      this.clearPendingExitConfirmation(true);
+    }
+
+    if (!this.canInteractWithInput()) {
       return;
     }
 
-    if ((key.ctrl && key.name === 'c') || key.name === 'return' || key.name === 'enter' || key.name === 'escape') {
-      this.clearInlineSuggestions();
+    if (key.ctrl && key.name === 'c') {
+      this.handleSigint();
       return;
     }
 
-    const baseInput = this.getCurrentReadlineInput();
-    const trimmed = baseInput.trimStart();
+    if (key.name === 'return' || key.name === 'enter') {
+      void this.submitCurrentInput();
+      return;
+    }
 
-    if (trimmed.startsWith('/') && (key.name === 'up' || key.name === 'down')) {
+    if (key.name === 'escape') {
+      this.autoCompleter.resetSuggestions();
+      this.renderPromptArea();
+      return;
+    }
+
+    if (this.shouldUseCommandSuggestionNavigation(key)) {
       if (key.name === 'up') {
         this.autoCompleter.previousSuggestion();
       } else {
         this.autoCompleter.nextSuggestion();
       }
-
-      setImmediate(() => {
-        if (this.getCurrentReadlineInput() !== baseInput) {
-          this.setReadlineInput(baseInput);
-        }
-        this.updateInlineSuggestionsFromReadline(true);
-      });
+      this.renderPromptArea();
       return;
     }
 
-    if (trimmed.startsWith('/') && key.name === 'tab') {
-      const completion = this.autoCompleter.getHighlightedCompletion(trimmed);
+    if ((key.name === 'up' || key.name === 'down') && this.navigateHistory(key.name === 'up' ? -1 : 1)) {
+      this.renderPromptArea();
+      return;
+    }
+
+    if (key.name === 'tab') {
+      const completion = this.autoCompleter.getHighlightedCompletion(this.getCurrentReadlineInput().trimStart());
       if (completion) {
-        setImmediate(() => {
-          this.setReadlineInput(completion);
-          this.updateInlineSuggestionsFromReadline(true);
-        });
+        this.setReadlineInput(completion);
+        this.renderPromptArea();
         return;
       }
     }
 
-    setImmediate(() => {
-      this.updateInlineSuggestionsFromReadline();
-    });
+    if ((key.ctrl && key.name === 'a') || key.name === 'home') {
+      this.inputCursor = 0;
+      this.renderPromptArea();
+      return;
+    }
+
+    if ((key.ctrl && key.name === 'e') || key.name === 'end') {
+      this.inputCursor = this.getInputCharCount();
+      this.renderPromptArea();
+      return;
+    }
+
+    if (key.ctrl && key.name === 'u') {
+      this.setReadlineInput('');
+      this.renderPromptArea();
+      return;
+    }
+
+    if (key.ctrl && key.name === 'l') {
+      this.resetTerminalView();
+      this.renderPromptArea();
+      return;
+    }
+
+    if (key.name === 'left' && this.moveInputCursor(-1)) {
+      this.renderPromptArea();
+      return;
+    }
+
+    if (key.name === 'right' && this.moveInputCursor(1)) {
+      this.renderPromptArea();
+      return;
+    }
+
+    if (key.name === 'backspace' && this.deleteInputBeforeCursor()) {
+      this.renderPromptArea();
+      return;
+    }
+
+    if (key.name === 'delete' && this.deleteInputAtCursor()) {
+      this.renderPromptArea();
+      return;
+    }
+
+    if (this.isPrintableInput(str, key)) {
+      this.insertTextAtCursor(str);
+      this.renderPromptArea();
+    }
   };
 
   constructor() {
@@ -100,8 +173,6 @@ export class CLI {
       this.trustCurrentPath.bind(this),
       this.checkCurrentPathTrust.bind(this)
     );
-
-    this.rl = this.createReadlineInterface();
   }
 
   async start() {
@@ -126,16 +197,7 @@ export class CLI {
     if (!process.stdout.isTTY) {
       return;
     }
-    const rlMaybeClosed = this.rl as readline.Interface & { closed?: boolean };
-    if (rlMaybeClosed.closed) {
-      return;
-    }
-
-    const divider = chalk.dim(this.getPromptDivider());
-    console.log(divider);
-    this.rl.setPrompt(chalk.white(this.promptPrefix));
-    this.rl.prompt();
-    this.promptVisibleLines = 2;
+    this.renderPromptArea();
   }
 
   private resetTerminalView(): void {
@@ -152,26 +214,245 @@ export class CLI {
     this.inlineSuggestionLines = 0;
     this.lastInlineSuggestionQuery = '';
     this.promptVisibleLines = 0;
+
+    const windowWidth = this.getHomeWindowWidth();
+    const panelContentWidth = Math.max(30, windowWidth - 4);
+    const [configLines, projectContextLines, trustLines] = await Promise.all([
+      this.getHomeConfigStatusLines(panelContentWidth),
+      this.getHomeProjectContextStatusLines(panelContentWidth),
+      this.getHomeTrustStatusLines(panelContentWidth),
+    ]);
+
+    if (!process.stdout.isTTY || windowWidth < 72) {
+      await this.showCompactWelcome(configLines, projectContextLines, trustLines);
+      return;
+    }
+
+    const workspaceLines = [...projectContextLines, ...trustLines];
+    const bodyLines = [
+      ...this.buildHomeHeroLines(windowWidth),
+      '',
+      ...this.buildHomeSection('Runtime', configLines, windowWidth),
+      '',
+      ...this.buildHomeSection('Workspace', workspaceLines, windowWidth),
+      '',
+      ...this.buildHomeSection('Quick Start', this.getHomeQuickStartLines(panelContentWidth), windowWidth),
+    ];
+
     console.log('');
-    console.log(chalk.bold('  Odradek'));
-    console.log(chalk.dim('  Internal Build: v0.0.3_0'));
-    console.log('');
-    await this.renderHomeConfigStatus();
-    await this.renderHomeProjectContextStatus();
-    await this.renderHomeTrustStatus();
-    console.log('');
-    console.log(chalk.dim('  Type a message to start chatting'));
-    console.log(
-      chalk.dim('  Type ') +
-        this.homeAccent('/') +
-        chalk.dim(' for commands, press ') +
-        this.homeAccent('Tab') +
-        chalk.dim(' to autocomplete')
-    );
+    this.renderHomeWindow(bodyLines, windowWidth);
     console.log('');
   }
 
-  private async renderHomeConfigStatus(): Promise<void> {
+  private async showCompactWelcome(
+    configLines: string[],
+    projectContextLines: string[],
+    trustLines: string[]
+  ): Promise<void> {
+    console.log('');
+    console.log(this.homeTitle.bold('  Odradek'));
+    console.log(`  ${this.homeAccent('='.repeat(Math.min(40, Math.max(18, (process.stdout.columns ?? 80) - 6))))}`);
+    console.log('');
+
+    const sections: Array<{ title: string; lines: string[] }> = [
+      { title: 'Runtime', lines: configLines },
+      { title: 'Workspace', lines: [...projectContextLines, ...trustLines] },
+      { title: 'Quick Start', lines: this.getHomeQuickStartLines(Math.max(24, (process.stdout.columns ?? 80) - 6)) },
+    ];
+
+    sections.forEach((section) => {
+      console.log(this.homeTitle.bold(`  ${section.title}`));
+      section.lines.forEach((line) => console.log(`  ${line}`));
+      console.log('');
+    });
+  }
+
+  private getHomeWindowWidth(): number {
+    const columns = process.stdout.columns ?? 88;
+    return Math.max(60, Math.min(104, columns - 6));
+  }
+
+  private renderHomeWindow(bodyLines: string[], width: number): void {
+    bodyLines.forEach((line) => {
+      console.log(`  ${line}`);
+    });
+  }
+
+  private buildHomeHeroLines(width: number): string[] {
+    return [this.buildHomeHeaderLine(width), ...this.buildHomeSignalStrip(width)];
+  }
+
+  private buildHomeHeaderLine(width: number): string {
+    const titleText = 'ODRADEK';
+    const title = this.homeTitle.bold(titleText);
+    const buildText = `Internal build: ${this.internalBuildVersion}`;
+    const buildLabel = this.homeMuted(buildText);
+    const gapWidth = Math.max(1, width - this.getDisplayWidth(titleText) - this.getDisplayWidth(buildText));
+    return `${title}${' '.repeat(gapWidth)}${buildLabel}`;
+  }
+
+  private buildHomeSignalStrip(width: number): string[] {
+    const palette = ['#3A4311', '#596A17', '#7F971E', '#AAC52B', '#D7F54A'];
+    const glyphs = ['░', '░', '▒', '▓', '█'];
+
+    return Array.from({ length: 3 }, (_unused, rowIndex) => {
+      let line = '';
+      for (let columnIndex = 0; columnIndex < width; columnIndex += 1) {
+        const wave = Math.sin(columnIndex / 3.6 + rowIndex * 0.85);
+        const ripple = Math.cos(columnIndex / 10.5 - rowIndex * 0.75);
+        const focusBoost = columnIndex < width * 0.22 ? 0.22 : columnIndex > width * 0.74 ? 0.18 : 0;
+        const intensity = Math.max(0.08, Math.min(0.98, 0.46 + wave * 0.22 + ripple * 0.18 + focusBoost));
+        const colorIndex = Math.min(palette.length - 1, Math.floor(intensity * palette.length));
+        const glyphIndex = Math.min(glyphs.length - 1, Math.floor(intensity * glyphs.length));
+        line += chalk.hex(palette[colorIndex])(glyphs[glyphIndex]);
+      }
+      return line;
+    });
+  }
+
+  private buildHomeSection(title: string, lines: string[], width: number): string[] {
+    const titleText = title.toUpperCase();
+    const topFill = Math.max(0, width - this.getDisplayWidth(titleText) - 5);
+    return [
+      this.homePanelBorder('┌─ ') + this.homeTitle.bold(titleText) + this.homePanelBorder(` ${'─'.repeat(topFill)}┐`),
+      ...lines.map((line) => `${this.homePanelBorder('│ ')}${this.padAnsiText(line, width - 4)}${this.homePanelBorder(' │')}`),
+      this.homePanelBorder(`└${'─'.repeat(width - 2)}┘`),
+    ];
+  }
+
+  private getHomeQuickStartLines(width: number): string[] {
+    return [
+      this.formatHomeKeyValueLine('chat', 'Type anything below to start a conversation', width, 'muted'),
+      this.formatHomeKeyValueLine('commands', '/ opens the command palette', width, 'accent'),
+      this.formatHomeKeyValueLine('starter cmds', '/noise_eval  /model  /provider  /trustpath', width, 'accent'),
+      this.formatHomeKeyValueLine('help', 'Run /help to see all available commands', width, 'muted'),
+    ];
+  }
+
+  private formatHomeKeyValueLine(
+    label: string,
+    value: string,
+    width: number,
+    tone: 'accent' | 'success' | 'warning' | 'danger' | 'muted' | 'default' = 'default'
+  ): string {
+    const normalizedLabel = `${label.padEnd(13)} `;
+    const valueWidth = Math.max(8, width - this.getDisplayWidth(normalizedLabel));
+    return this.homeMuted(normalizedLabel) + this.colorizeHomeValue(this.truncatePlainText(value, valueWidth), tone);
+  }
+
+  private readPackageVersion(): string {
+    try {
+      const currentFilePath = fileURLToPath(import.meta.url);
+      const packageJsonPath = path.resolve(path.dirname(currentFilePath), '../../package.json');
+      const raw = fs.readFileSync(packageJsonPath, 'utf-8');
+      const parsed = JSON.parse(raw) as { version?: unknown };
+      return typeof parsed.version === 'string' && parsed.version.trim() ? parsed.version.trim() : 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private colorizeHomeValue(
+    value: string,
+    tone: 'accent' | 'success' | 'warning' | 'danger' | 'muted' | 'default'
+  ): string {
+    switch (tone) {
+      case 'accent':
+        return this.homeAccent(value);
+      case 'success':
+        return this.homeSuccess(value);
+      case 'warning':
+        return this.homeWarning(value);
+      case 'danger':
+        return this.homeDanger(value);
+      case 'muted':
+        return this.homeMuted(value);
+      default:
+        return this.homeTitle(value);
+    }
+  }
+
+  private truncatePlainText(value: string, maxWidth: number): string {
+    if (maxWidth <= 0) {
+      return '';
+    }
+
+    if (this.getDisplayWidth(value) <= maxWidth) {
+      return value;
+    }
+
+    const ellipsis = maxWidth >= 3 ? '...' : '.';
+    const targetWidth = Math.max(0, maxWidth - this.getDisplayWidth(ellipsis));
+    let truncated = '';
+
+    for (const character of Array.from(value)) {
+      const candidate = truncated + character;
+      if (this.getDisplayWidth(candidate) > targetWidth) {
+        break;
+      }
+      truncated = candidate;
+    }
+
+    return truncated + ellipsis;
+  }
+
+  private truncateMiddleText(value: string, maxWidth: number): string {
+    if (maxWidth <= 0) {
+      return '';
+    }
+
+    if (this.getDisplayWidth(value) <= maxWidth) {
+      return value;
+    }
+
+    const ellipsis = maxWidth >= 3 ? '...' : '.';
+    const targetWidth = Math.max(0, maxWidth - this.getDisplayWidth(ellipsis));
+    const headWidth = Math.ceil(targetWidth / 2);
+    const tailWidth = Math.floor(targetWidth / 2);
+
+    let head = '';
+    for (const character of Array.from(value)) {
+      const candidate = head + character;
+      if (this.getDisplayWidth(candidate) > headWidth) {
+        break;
+      }
+      head = candidate;
+    }
+
+    let tail = '';
+    for (const character of Array.from(value).reverse()) {
+      const candidate = character + tail;
+      if (this.getDisplayWidth(candidate) > tailWidth) {
+        break;
+      }
+      tail = candidate;
+    }
+
+    return `${head}${ellipsis}${tail}`;
+  }
+
+  private formatDisplayPathForHome(inputPath: string, maxWidth: number): string {
+    const userHome = process.env.USERPROFILE?.replace(/\\/g, '/');
+    let normalized = inputPath.replace(/\\/g, '/');
+    if (userHome && normalized.startsWith(userHome)) {
+      normalized = `~${normalized.slice(userHome.length)}`;
+    }
+    return this.truncateMiddleText(normalized, maxWidth);
+  }
+
+  private padAnsiText(value: string, width: number): string {
+    const visibleWidth = this.getDisplayWidth(this.stripAnsi(value));
+    if (visibleWidth >= width) {
+      return value;
+    }
+    return value + ' '.repeat(width - visibleWidth);
+  }
+
+  private stripAnsi(value: string): string {
+    return value.replace(/\x1b\[[0-9;]*m/g, '');
+  }
+
+  private async getHomeConfigStatusLines(width: number): Promise<string[]> {
     try {
       const config = await this.configStore.getConfig();
       const diagnostics = await this.configStore.getConfigDiagnostics();
@@ -182,57 +463,77 @@ export class CLI {
       const currentModel = providerConfig.model?.trim();
       const currentBaseUrl = providerConfig.baseUrl?.trim() || providerMeta.defaultBaseUrl;
       const sourceSummary = this.summarizeProviderConfigSource(diagnostics.providerSources[activeProvider]);
+      const lines: string[] = [];
 
       if (apiKey && currentModel) {
-        console.log(chalk.green('  Model Config: ready'));
-        console.log(chalk.dim('  Active provider: ') + this.homeAccent(providerMeta.displayName));
-        console.log(chalk.dim('  Config source: ') + this.homeAccent(sourceSummary));
-        console.log(chalk.dim('  Current model: ') + this.homeAccent(currentModel));
-        console.log(chalk.dim('  Base URL: ') + this.homeAccent(currentBaseUrl));
-        this.renderEnvironmentStatusLines(diagnostics, activeProvider);
-        return;
+        lines.push(this.formatHomeKeyValueLine('status', 'ready', width, 'success'));
+        lines.push(this.formatHomeKeyValueLine('provider', providerMeta.displayName, width, 'default'));
+        lines.push(this.formatHomeKeyValueLine('source', sourceSummary, width, 'accent'));
+        lines.push(this.formatHomeKeyValueLine('model', currentModel, width, 'accent'));
+        lines.push(
+          this.formatHomeKeyValueLine(
+            'path',
+            this.formatDisplayPathForHome(process.cwd(), Math.max(12, width - 14)),
+            width,
+            'muted'
+          )
+        );
+        lines.push(this.formatHomeKeyValueLine('endpoint', currentBaseUrl, width, 'muted'));
+        lines.push(...this.getEnvironmentStatusLines(diagnostics, activeProvider, width));
+        return lines;
       }
 
-      console.log(chalk.yellow('  Model Config: incomplete'));
-      console.log(chalk.dim('  Active provider: ') + this.homeAccent(providerMeta.displayName));
+      lines.push(this.formatHomeKeyValueLine('status', 'needs setup', width, 'warning'));
+      lines.push(this.formatHomeKeyValueLine('provider', providerMeta.displayName, width, 'default'));
+      lines.push(
+        this.formatHomeKeyValueLine(
+          'path',
+          this.formatDisplayPathForHome(process.cwd(), Math.max(12, width - 14)),
+          width,
+          'muted'
+        )
+      );
       if (!apiKey) {
-        console.log(
-          chalk.dim('  Set ') +
-            this.homeAccent(providerMeta.envKeys.apiKey.join(' / ')) +
-            chalk.dim(' in .env to finish setup')
+        lines.push(
+          this.formatHomeKeyValueLine(
+            'missing key',
+            `Set ${providerMeta.envKeys.apiKey.join(' / ')} in .env`,
+            width,
+            'warning'
+          )
         );
       }
       if (!currentModel) {
-        console.log(
-          chalk.dim('  Set ') +
-            this.homeAccent(providerMeta.envKeys.model.join(' / ')) +
-            chalk.dim(' or run ') +
-            this.homeAccent('/model <model-name>') +
-            chalk.dim(' to finish setup')
+        lines.push(
+          this.formatHomeKeyValueLine(
+            'missing model',
+            `Set ${providerMeta.envKeys.model.join(' / ')} or run /model <model-name>`,
+            width,
+            'warning'
+          )
         );
       }
-      console.log(chalk.dim('  Current Base URL: ') + this.homeAccent(currentBaseUrl));
-      this.renderEnvironmentStatusLines(diagnostics, activeProvider);
+      lines.push(this.formatHomeKeyValueLine('endpoint', currentBaseUrl, width, 'muted'));
+      lines.push(...this.getEnvironmentStatusLines(diagnostics, activeProvider, width));
+      return lines;
     } catch {
-      console.log(chalk.red('  Failed to read model configuration state'));
-      console.log(chalk.dim('  Check your .env and restart the CLI'));
+      return [
+        this.formatHomeKeyValueLine('status', 'failed to read model configuration state', width, 'danger'),
+        this.formatHomeKeyValueLine('hint', 'Check your .env and restart the CLI', width, 'muted'),
+      ];
     }
   }
 
-  private async renderHomeProjectContextStatus(): Promise<void> {
+  private async getHomeProjectContextStatusLines(width: number): Promise<string[]> {
     try {
       const config = await this.configStore.getConfig();
       const enabled = config.projectContextEnabled;
-      const state = enabled ? chalk.green('enabled') : chalk.yellow('disabled');
-      console.log(chalk.dim('  Project Context: ') + state);
-      console.log(
-        chalk.dim('  Toggle with ') +
-          this.homeAccent('/projectcontext on') +
-          chalk.dim(' / ') +
-          this.homeAccent('/projectcontext off')
-      );
+      return [
+        this.formatHomeKeyValueLine('project ctx', enabled ? 'enabled' : 'disabled', width, enabled ? 'success' : 'warning'),
+        this.formatHomeKeyValueLine('toggle', '/projectcontext [on|off]', width, 'accent'),
+      ];
     } catch {
-      console.log(chalk.red('  Project Context: failed to read config'));
+      return [this.formatHomeKeyValueLine('project ctx', 'failed to read config', width, 'danger')];
     }
   }
 
@@ -289,61 +590,24 @@ export class CLI {
     });
   }
 
-  private async renderHomeTrustStatus(): Promise<void> {
+  private async getHomeTrustStatusLines(width: number): Promise<string[]> {
     const currentPath = process.cwd();
     try {
       const trusted = await this.configStore.isPathTrusted(currentPath);
-      const status = trusted ? chalk.green('trusted') : chalk.yellow('not trusted');
-      console.log(chalk.dim('  Trust Check: ') + status);
-      console.log(chalk.dim('  Current path: ') + this.homeAccent(currentPath));
-      if (!trusted) {
-        console.log(chalk.dim('  Run ') + this.homeAccent('/trustpath') + chalk.dim(' to trust this directory'));
+      if (trusted) {
+        return [];
       }
+
+      return [
+        this.formatHomeKeyValueLine('hint', 'Run /trustpath to trust this directory', width, 'accent'),
+      ];
     } catch {
-      console.log(chalk.red('  Trust Check: failed'));
+      return [this.formatHomeKeyValueLine('trust', 'failed', width, 'danger')];
     }
   }
 
   private setupReadline(): void {
-    this.bindLineModeHandlers();
     this.bindInputAssistHandlers();
-  }
-
-  private createReadlineInterface(): readline.Interface {
-    const isTerminal = Boolean(process.stdout.isTTY);
-    return readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      prompt: chalk.cyan(this.getPromptText()),
-      completer: this.autoCompleter.completer.bind(this.autoCompleter),
-      terminal: isTerminal,
-    });
-  }
-
-  private bindLineModeHandlers(): void {
-    this.rl.removeAllListeners('line');
-    this.rl.removeAllListeners('SIGINT');
-
-    this.rl.on('line', async (line) => {
-      this.isLineProcessing = true;
-      try {
-        this.clearInlineSuggestions();
-        this.clearPromptEchoBlock();
-        const input = line.trim();
-        if (input) {
-          await this.handleInput(input);
-        }
-      } finally {
-        this.isLineProcessing = false;
-        if (!this.isInteractiveCommandActive) {
-          this.showPrompt();
-        }
-      }
-    });
-
-    this.rl.on('SIGINT', () => {
-      this.exitWithFarewell();
-    });
   }
 
   private bindInputAssistHandlers(): void {
@@ -351,94 +615,79 @@ export class CLI {
       return;
     }
 
-    readline.emitKeypressEvents(process.stdin, this.rl);
+    readline.emitKeypressEvents(process.stdin);
+    if (typeof process.stdin.setRawMode === 'function') {
+      process.stdin.setRawMode(true);
+    }
+    process.stdin.resume();
     process.stdin.removeListener('keypress', this.onInputAssistKeypress);
     process.stdin.on('keypress', this.onInputAssistKeypress);
   }
 
+  private canInteractWithInput(): boolean {
+    return Boolean(process.stdin.isTTY && process.stdout.isTTY && !this.isInteractiveCommandActive && !this.isLineProcessing);
+  }
+
+  private shouldUseCommandSuggestionNavigation(key?: readline.Key): boolean {
+    if (!key || (key.name !== 'up' && key.name !== 'down') || !this.canInteractWithInput()) {
+      return false;
+    }
+
+    return this.getCurrentReadlineInput().trimStart().startsWith('/');
+  }
+
   private getCurrentReadlineInput(): string {
-    const rlWithLine = this.rl as readline.Interface & { line?: string };
-    return typeof rlWithLine.line === 'string' ? rlWithLine.line : '';
+    return this.inputValue;
+  }
+
+  private getReadlineCursorIndex(): number {
+    return Math.max(0, Math.min(this.inputCursor, this.getInputCharCount()));
+  }
+
+  private getReadlineCursorPos(): readline.CursorPos {
+    return {
+      rows: 0,
+      cols: this.getPromptCursorColumn(),
+    };
+  }
+
+  private getPromptScreenLineCount(): number {
+    return 1;
+  }
+
+  private syncPromptLayoutFromReadline(): void {
+    const suggestionLines = this.getPromptSuggestionLines();
+    this.inlineSuggestionLines = suggestionLines.length;
+    this.promptVisibleLines = 3 + suggestionLines.length;
   }
 
   private updateInlineSuggestionsFromReadline(force = false): void {
-    if (!this.canRenderInlineSuggestions()) {
+    if (!this.canInteractWithInput()) {
       return;
     }
 
-    const line = this.getCurrentReadlineInput();
-    const trimmed = line.trimStart();
-
-    if (!trimmed.startsWith('/')) {
-      this.clearInlineSuggestions();
-      this.lastInlineSuggestionQuery = '';
+    if (!force && this.lastInlineSuggestionQuery === this.getCurrentReadlineInput().trimStart()) {
       return;
     }
 
-    const query = trimmed.slice(1).toLowerCase();
-    if (!force && query === this.lastInlineSuggestionQuery && this.inlineSuggestionLines > 0) {
-      return;
-    }
-
-    const lines = this.autoCompleter.getSuggestionLines(trimmed, 6);
-    this.renderInlineSuggestions(lines);
-    this.lastInlineSuggestionQuery = query;
+    this.renderPromptArea();
   }
 
   private renderInlineSuggestions(lines: string[]): void {
-    if (!this.canRenderInlineSuggestions()) {
+    if (!this.canInteractWithInput()) {
       return;
     }
-
-    this.clearInlineSuggestions();
-    if (lines.length === 0) {
-      return;
-    }
-
-    const safeLines = this.fitSuggestionLinesToTerminal(lines);
-    const promptWidth = this.getDisplayWidth(this.promptPrefix);
-    const inputWidth = this.getDisplayWidth(this.getCurrentReadlineInput());
-
-    readline.moveCursor(process.stdout, 0, 1);
-    safeLines.forEach((line, index) => {
-      readline.clearLine(process.stdout, 0);
-      process.stdout.write(line);
-      if (index < safeLines.length - 1) {
-        process.stdout.write('\n');
-      }
-    });
-
-    readline.moveCursor(process.stdout, 0, -safeLines.length);
-    readline.cursorTo(process.stdout, promptWidth + inputWidth);
-
-    this.inlineSuggestionLines = safeLines.length;
+    this.renderPromptArea(lines);
   }
 
   private clearInlineSuggestions(): void {
-    if (!process.stdout.isTTY || this.inlineSuggestionLines === 0 || this.promptVisibleLines === 0) {
-      return;
-    }
-
-    const promptWidth = this.getDisplayWidth(this.promptPrefix);
-    const inputWidth = this.getDisplayWidth(this.getCurrentReadlineInput());
-
-    readline.moveCursor(process.stdout, 0, 1);
-    for (let i = 0; i < this.inlineSuggestionLines; i++) {
-      readline.clearLine(process.stdout, 0);
-      if (i < this.inlineSuggestionLines - 1) {
-        readline.moveCursor(process.stdout, 0, 1);
-      }
-    }
-
-    readline.moveCursor(process.stdout, 0, -this.inlineSuggestionLines);
-    readline.cursorTo(process.stdout, promptWidth + inputWidth);
     this.inlineSuggestionLines = 0;
   }
 
   private clearSuggestions(): void {
-    this.clearInlineSuggestions();
     this.autoCompleter.resetSuggestions();
     this.lastInlineSuggestionQuery = '';
+    this.inlineSuggestionLines = 0;
   }
 
   private clearPromptEchoBlock(): void {
@@ -446,46 +695,42 @@ export class CLI {
       return;
     }
 
-    const rlMaybeClosed = this.rl as readline.Interface & { closed?: boolean };
-    if (rlMaybeClosed.closed) {
-      return;
-    }
-
     if (this.promptVisibleLines <= 0) {
       return;
     }
 
-    // Remove only the visible prompt block (divider + prompt line), do not erase chat content above it.
-    readline.clearLine(process.stdout, 0);
-    readline.cursorTo(process.stdout, 0);
-
-    for (let i = 1; i < this.promptVisibleLines; i++) {
-      readline.moveCursor(process.stdout, 0, -1);
+    readline.moveCursor(process.stdout, 0, -1);
+    for (let i = 0; i < this.promptVisibleLines; i += 1) {
       readline.clearLine(process.stdout, 0);
       readline.cursorTo(process.stdout, 0);
+      if (i < this.promptVisibleLines - 1) {
+        readline.moveCursor(process.stdout, 0, 1);
+      }
+    }
+    if (this.promptVisibleLines > 1) {
+      readline.moveCursor(process.stdout, 0, -(this.promptVisibleLines - 1));
     }
 
     this.promptVisibleLines = 0;
+    this.inlineSuggestionLines = 0;
   }
 
   private canRenderInlineSuggestions(): boolean {
-    return Boolean(
-      process.stdin.isTTY &&
-        process.stdout.isTTY &&
-        !this.isInteractiveCommandActive &&
-        !this.isLineProcessing &&
-        this.promptVisibleLines > 0
-    );
+    return this.canInteractWithInput();
   }
 
   private setReadlineInput(value: string): void {
-    this.rl.write(null, { ctrl: true, name: 'u' });
-    this.rl.write(value);
+    const normalized = value.replace(/\r/g, '').replace(/\n/g, ' ');
+    this.inputValue = normalized;
+    this.inputCursor = this.getCharCount(normalized);
+    this.historyIndex = -1;
+    this.historyDraftValue = '';
+    this.lastInlineSuggestionQuery = '';
   }
 
   private fitSuggestionLinesToTerminal(lines: string[]): string[] {
-    const columns = Math.max(20, (process.stdout.columns ?? 120) - 1);
-    return lines.map((line) => this.truncateAnsiLine(line, columns));
+    const columns = Math.max(20, (process.stdout.columns ?? 120) - 2);
+    return lines.map((line) => `  ${this.truncateAnsiLine(line, columns)}`);
   }
 
   private truncateAnsiLine(input: string, maxWidth: number): string {
@@ -514,7 +759,289 @@ export class CLI {
     return visible + suffix;
   }
 
+  private renderPromptArea(suggestionLines?: string[]): void {
+    if (!process.stdout.isTTY) {
+      return;
+    }
+
+    const { lines, cursorCol, suggestionCount, query } = this.buildPromptArea(suggestionLines);
+    this.clearPromptEchoBlock();
+
+    lines.forEach((line, index) => {
+      readline.clearLine(process.stdout, 0);
+      readline.cursorTo(process.stdout, 0);
+      process.stdout.write(line);
+      if (index < lines.length - 1) {
+        process.stdout.write('\n');
+      }
+    });
+
+    const linesBelowInput = Math.max(0, lines.length - 2);
+    if (linesBelowInput > 0) {
+      readline.moveCursor(process.stdout, 0, -linesBelowInput);
+    }
+    readline.cursorTo(process.stdout, cursorCol);
+
+    this.promptVisibleLines = lines.length;
+    this.inlineSuggestionLines = suggestionCount;
+    this.lastInlineSuggestionQuery = query;
+  }
+
+  private buildPromptArea(suggestionLines?: string[]): {
+    lines: string[];
+    cursorCol: number;
+    suggestionCount: number;
+    query: string;
+  } {
+    const { line: inputLine, cursorCol } = this.buildPromptInputLine();
+    const effectiveSuggestions = suggestionLines ?? this.getPromptSuggestionLines();
+    const query = this.getCurrentReadlineInput().trimStart();
+    return {
+      lines: [chalk.dim(this.getPromptDivider()), inputLine, this.buildPromptFooterLine(), ...effectiveSuggestions],
+      cursorCol,
+      suggestionCount: effectiveSuggestions.length,
+      query,
+    };
+  }
+
+  private buildPromptInputLine(): { line: string; cursorCol: number } {
+    const columns = Math.max(24, process.stdout.columns ?? 80);
+    const leftMargin = '  ';
+    const prefixWidth = this.getDisplayWidth(leftMargin) + this.getDisplayWidth(this.promptPrefix);
+    const visibleWidth = Math.max(8, columns - prefixWidth - 1);
+
+    if (!this.inputValue) {
+      return {
+        line: `${leftMargin}${this.homeAccent(this.promptPrefix)}${chalk.dim(this.truncatePlainText(this.promptPlaceholder, visibleWidth))}`,
+        cursorCol: prefixWidth,
+      };
+    }
+
+    const window = this.getVisibleInputWindow(visibleWidth);
+    return {
+      line: `${leftMargin}${this.homeAccent(this.promptPrefix)}${chalk.white(window.visibleText || ' ')}`,
+      cursorCol: prefixWidth + window.cursorWidth,
+    };
+  }
+
+  private buildPromptFooterLine(): string {
+    const columns = Math.max(20, process.stdout.columns ?? 80);
+    if (this.hasPendingExitConfirmation() || this.exitConfirmationNoticeVisible) {
+      return `  ${this.truncateAnsiLine(chalk.yellow('Press Ctrl+C again within 3 seconds to exit.'), columns - 2)}`;
+    }
+
+    if (this.getCurrentReadlineInput().trimStart().startsWith('/')) {
+      return `  ${this.truncateAnsiLine(chalk.dim('Tab complete, ↑↓ choose command, Enter run'), columns - 2)}`;
+    }
+
+    return `  ${this.truncateAnsiLine(chalk.dim('/ commands, ↑↓ history, Ctrl+U clear'), columns - 2)}`;
+  }
+
+  private getPromptSuggestionLines(): string[] {
+    const trimmed = this.getCurrentReadlineInput().trimStart();
+    if (!trimmed.startsWith('/')) {
+      return [];
+    }
+
+    return this.fitSuggestionLinesToTerminal(this.autoCompleter.getSuggestionLines(trimmed, 6));
+  }
+
+  private getPromptCursorColumn(): number {
+    const leftMargin = '  ';
+    const prefixWidth = this.getDisplayWidth(leftMargin) + this.getDisplayWidth(this.promptPrefix);
+    if (!this.inputValue) {
+      return prefixWidth;
+    }
+
+    const columns = Math.max(24, process.stdout.columns ?? 80);
+    const visibleWidth = Math.max(8, columns - prefixWidth - 1);
+    return prefixWidth + this.getVisibleInputWindow(visibleWidth).cursorWidth;
+  }
+
+  private getVisibleInputWindow(maxWidth: number): { visibleText: string; cursorWidth: number } {
+    const chars = this.getInputChars();
+    if (chars.length === 0) {
+      return { visibleText: '', cursorWidth: 0 };
+    }
+
+    const cursorIndex = this.getReadlineCursorIndex();
+    let start = 0;
+    while (start < cursorIndex) {
+      const reserveLeft = start > 0 ? 1 : 0;
+      const reserveRight = cursorIndex < chars.length ? 1 : 0;
+      const widthToCursor = this.getDisplayWidth(chars.slice(start, cursorIndex).join(''));
+      if (reserveLeft + widthToCursor + reserveRight <= maxWidth) {
+        break;
+      }
+      start += 1;
+    }
+
+    const visibleChars: string[] = [];
+    let end = start;
+    let usedWidth = start > 0 ? 1 : 0;
+    while (end < chars.length) {
+      const charWidth = this.getCharDisplayWidth(chars[end]);
+      const reserveRight = end < chars.length - 1 ? 1 : 0;
+      if (usedWidth + charWidth + reserveRight > maxWidth) {
+        break;
+      }
+      visibleChars.push(chars[end]);
+      usedWidth += charWidth;
+      end += 1;
+    }
+
+    const cursorWidth = (start > 0 ? 1 : 0) + this.getDisplayWidth(chars.slice(start, cursorIndex).join(''));
+    return {
+      visibleText: `${start > 0 ? '…' : ''}${visibleChars.join('')}${end < chars.length ? '…' : ''}`,
+      cursorWidth,
+    };
+  }
+
+  private submitCurrentInput(): Promise<void> {
+    const rawInput = this.inputValue;
+    const trimmedInput = rawInput.trim();
+    if (this.isLineProcessing || !trimmedInput) {
+      this.renderPromptArea();
+      return Promise.resolve();
+    }
+
+    this.isLineProcessing = true;
+    this.clearPendingExitConfirmation();
+    this.commitInputToHistory(rawInput);
+    this.clearSuggestions();
+    this.setReadlineInput('');
+    this.clearPromptEchoBlock();
+
+    return this.handleInput(trimmedInput).finally(() => {
+      this.isLineProcessing = false;
+      if (!this.isInteractiveCommandActive) {
+        this.showPrompt();
+      }
+    });
+  }
+
+  private commitInputToHistory(value: string): void {
+    const normalized = value.trim();
+    if (!normalized) {
+      return;
+    }
+
+    if (this.inputHistory[this.inputHistory.length - 1] !== value) {
+      this.inputHistory.push(value);
+    }
+    this.historyIndex = -1;
+    this.historyDraftValue = '';
+  }
+
+  private navigateHistory(direction: -1 | 1): boolean {
+    if (this.inputHistory.length === 0) {
+      return false;
+    }
+
+    if (direction === -1) {
+      if (this.historyIndex === -1) {
+        this.historyDraftValue = this.inputValue;
+        this.historyIndex = this.inputHistory.length - 1;
+      } else if (this.historyIndex > 0) {
+        this.historyIndex -= 1;
+      } else {
+        return false;
+      }
+
+      const next = this.inputHistory[this.historyIndex] ?? '';
+      this.inputValue = next;
+      this.inputCursor = this.getCharCount(next);
+      return true;
+    }
+
+    if (this.historyIndex === -1) {
+      return false;
+    }
+
+    if (this.historyIndex < this.inputHistory.length - 1) {
+      this.historyIndex += 1;
+      const next = this.inputHistory[this.historyIndex] ?? '';
+      this.inputValue = next;
+      this.inputCursor = this.getCharCount(next);
+      return true;
+    }
+
+    this.historyIndex = -1;
+    this.inputValue = this.historyDraftValue;
+    this.inputCursor = this.getCharCount(this.historyDraftValue);
+    this.historyDraftValue = '';
+    return true;
+  }
+
+  private insertTextAtCursor(text: string): void {
+    const cleaned = text.replace(/\r/g, '').replace(/\n/g, ' ');
+    if (!cleaned) {
+      return;
+    }
+
+    const chars = this.getInputChars();
+    chars.splice(this.inputCursor, 0, ...Array.from(cleaned));
+    this.inputValue = chars.join('');
+    this.inputCursor += Array.from(cleaned).length;
+    this.historyIndex = -1;
+  }
+
+  private moveInputCursor(delta: number): boolean {
+    const next = Math.max(0, Math.min(this.getInputCharCount(), this.inputCursor + delta));
+    if (next === this.inputCursor) {
+      return false;
+    }
+    this.inputCursor = next;
+    return true;
+  }
+
+  private deleteInputBeforeCursor(): boolean {
+    if (this.inputCursor <= 0) {
+      return false;
+    }
+
+    const chars = this.getInputChars();
+    chars.splice(this.inputCursor - 1, 1);
+    this.inputValue = chars.join('');
+    this.inputCursor -= 1;
+    this.historyIndex = -1;
+    return true;
+  }
+
+  private deleteInputAtCursor(): boolean {
+    const chars = this.getInputChars();
+    if (this.inputCursor >= chars.length) {
+      return false;
+    }
+
+    chars.splice(this.inputCursor, 1);
+    this.inputValue = chars.join('');
+    this.historyIndex = -1;
+    return true;
+  }
+
+  private isPrintableInput(str: string, key: readline.Key): boolean {
+    if (!str || key.ctrl || key.meta) {
+      return false;
+    }
+
+    return !/[\r\n\t]/.test(str);
+  }
+
+  private getInputChars(): string[] {
+    return Array.from(this.inputValue);
+  }
+
+  private getInputCharCount(): number {
+    return this.getCharCount(this.inputValue);
+  }
+
+  private getCharCount(text: string): number {
+    return Array.from(text).length;
+  }
+
   private async handleInput(input: string): Promise<void> {
+    this.clearPendingExitConfirmation();
     this.clearInlineSuggestions();
     this.lastInlineSuggestionQuery = '';
 
@@ -915,11 +1442,10 @@ export class CLI {
     } catch {
       // Ignore stdin resume errors.
     }
-
-    const rlMaybeClosed = this.rl as readline.Interface & { closed?: boolean };
-    if (rlMaybeClosed.closed) {
-      this.rl = this.createReadlineInterface();
-      this.bindLineModeHandlers();
+    if (process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
+      process.stdin.setRawMode(true);
+    }
+    if (process.stdin.isTTY && process.stdout.isTTY) {
       this.bindInputAssistHandlers();
     }
   }
@@ -984,52 +1510,29 @@ export class CLI {
     return 1;
   }
 
-  private renderEnvironmentStatusLines(diagnostics: ConfigDiagnostics, provider: ProviderName): void {
+  private getEnvironmentStatusLines(
+    diagnostics: ConfigDiagnostics,
+    provider: ProviderName,
+    width: number
+  ): string[] {
     const providerSources = diagnostics.providerSources[provider];
-    const envOverrides = this.getEnvironmentOverrideLabels(providerSources);
     const sessionOverrides = this.getSessionOverrideLabels(providerSources);
+    const lines: string[] = [];
 
     if (diagnostics.loadedEnvFiles.length > 0) {
-      console.log(chalk.dim('  Loaded env files: ') + this.homeAccent(diagnostics.loadedEnvFiles.join(', ')));
+      lines.push(this.formatHomeKeyValueLine('env files', diagnostics.loadedEnvFiles.join(', '), width, 'accent'));
     }
 
     if (diagnostics.activeProviderSource === 'env') {
-      console.log(chalk.yellow('  Environment override active: ') + chalk.white('Active Provider'));
-      console.log(chalk.dim('  Runtime active provider is currently controlled by ODRADEK_ACTIVE_PROVIDER'));
-    }
-
-    if (envOverrides.length > 0 || diagnostics.projectContextEnabledSource === 'env') {
-      const segments = [...envOverrides];
-      if (diagnostics.projectContextEnabledSource === 'env') {
-        segments.push('Project Context');
-      }
-
-      console.log(chalk.yellow('  Environment override active: ') + chalk.white(segments.join(', ')));
-      console.log(chalk.dim('  Runtime provider settings come from process.env/.env'));
+      lines.push(this.formatHomeKeyValueLine('env override', 'Active Provider', width, 'warning'));
     }
 
     if (sessionOverrides.length > 0) {
-      console.log(chalk.green('  Session override active: ') + chalk.white(sessionOverrides.join(', ')));
-      console.log(chalk.dim('  Use ') + this.homeAccent('/model clear') + chalk.dim(' to return to the configured default model'));
-    }
-  }
-
-  private getEnvironmentOverrideLabels(sources: ProviderConfigSources): string[] {
-    const labels: string[] = [];
-
-    if (sources.apiKey === 'env') {
-      labels.push('API Key');
+      lines.push(this.formatHomeKeyValueLine('session', sessionOverrides.join(', '), width, 'success'));
+      lines.push(this.formatHomeKeyValueLine('reset', 'Use /model clear to restore the configured default model', width, 'accent'));
     }
 
-    if (sources.baseUrl === 'env') {
-      labels.push('Base URL');
-    }
-
-    if (sources.model === 'env') {
-      labels.push('Model');
-    }
-
-    return labels;
+    return lines;
   }
 
   private getSessionOverrideLabels(sources: ProviderConfigSources): string[] {
@@ -1086,7 +1589,59 @@ export class CLI {
     return error instanceof Error && error.name === 'ExitPromptError';
   }
 
+  private handleSigint(): void {
+    if (this.hasPendingExitConfirmation()) {
+      this.clearPendingExitConfirmation(true);
+      this.exitWithFarewell();
+    }
+
+    this.pendingExitConfirmationUntil = Date.now() + CLI.EXIT_CONFIRM_WINDOW_MS;
+    if (this.pendingExitConfirmationTimer) {
+      clearTimeout(this.pendingExitConfirmationTimer);
+    }
+    this.pendingExitConfirmationTimer = setTimeout(() => {
+      this.clearPendingExitConfirmation(true);
+    }, CLI.EXIT_CONFIRM_WINDOW_MS);
+
+    this.clearSuggestions();
+    if (this.getCurrentReadlineInput()) {
+      this.setReadlineInput('');
+    }
+    this.exitConfirmationNoticeVisible = true;
+    if (!this.isInteractiveCommandActive && !this.isLineProcessing) {
+      this.renderPromptArea();
+    }
+  }
+
+  private hasPendingExitConfirmation(): boolean {
+    return this.pendingExitConfirmationUntil > Date.now();
+  }
+
+  private clearPendingExitConfirmation(clearNotice = false): void {
+    this.pendingExitConfirmationUntil = 0;
+    if (this.pendingExitConfirmationTimer) {
+      clearTimeout(this.pendingExitConfirmationTimer);
+      this.pendingExitConfirmationTimer = null;
+    }
+    if (clearNotice) {
+      this.clearExitConfirmationNotice();
+    }
+  }
+
+  private clearExitConfirmationNotice(): void {
+    if (!this.exitConfirmationNoticeVisible) {
+      return;
+    }
+
+    this.exitConfirmationNoticeVisible = false;
+
+    if (!this.isInteractiveCommandActive && !this.isLineProcessing) {
+      this.renderPromptArea();
+    }
+  }
+
   private exitWithFarewell(): never {
+    this.clearPendingExitConfirmation(true);
     console.log('\nBye!');
     process.exit(0);
   }
@@ -1131,6 +1686,10 @@ export class CLI {
   }
 
   stop(): void {
-    this.rl.close();
+    this.clearPendingExitConfirmation(true);
+    process.stdin.removeListener('keypress', this.onInputAssistKeypress);
+    if (process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
+      process.stdin.setRawMode(false);
+    }
   }
 }

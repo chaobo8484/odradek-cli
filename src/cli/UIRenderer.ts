@@ -6,6 +6,8 @@ export class UIRenderer {
   private readonly BORDER_COLOR = chalk.dim;
   private readonly USER_COLOR = chalk.white;
   private readonly ASSISTANT_COLOR = chalk.cyan;
+  private readonly INFO_COLOR = chalk.hex('#D6F54A');
+  private readonly MIMO_PRO_COLOR = chalk.hex('#D6F54A');
   private readonly GUTTER = '|';
 
   constructor(conversationManager: ConversationManager) {
@@ -29,9 +31,10 @@ export class UIRenderer {
   }
 
   private renderMessage(message: Message): void {
+    const modelLabel = message.renderMetadata?.modelLabel?.trim();
     const roleLabel =
-      message.role === 'assistant' && message.renderMetadata?.modelLabel?.trim()
-        ? `Odradek(${message.renderMetadata.modelLabel.trim()})`
+      message.role === 'assistant' && modelLabel
+        ? `Odradek(${modelLabel})`
         : message.role === 'user'
           ? 'You'
           : 'Odradek';
@@ -43,7 +46,7 @@ export class UIRenderer {
     if (message.role === 'user') {
       console.log('  ' + this.USER_COLOR.bold(roleLabel) + meta);
     } else {
-      console.log('  ' + this.ASSISTANT_COLOR.bold(roleLabel) + meta);
+      console.log('  ' + chalk.bold(this.getAssistantRoleColor(modelLabel)(roleLabel)) + meta);
     }
 
     if (message.collapsed) {
@@ -86,6 +89,14 @@ export class UIRenderer {
         console.log(this.BORDER_COLOR(`  ${this.GUTTER} `) + chalk.dim(segment));
       });
     });
+  }
+
+  private getAssistantRoleColor(modelLabel?: string): (value: string) => string {
+    if (modelLabel?.toLowerCase() === 'xiaomi/mimo-v2-pro') {
+      return this.MIMO_PRO_COLOR;
+    }
+
+    return this.ASSISTANT_COLOR;
   }
 
   private truncateContent(content: string, maxLength = 60): string {
@@ -162,7 +173,7 @@ export class UIRenderer {
 
   renderInfo(message: string): void {
     console.log('');
-    console.log(chalk.dim(`  ${this.GUTTER} `) + chalk.cyan('i ') + chalk.gray(message));
+    console.log(chalk.dim(`  ${this.GUTTER} `) + this.INFO_COLOR('i ') + chalk.gray(message));
   }
 
   renderWarning(message: string): void {

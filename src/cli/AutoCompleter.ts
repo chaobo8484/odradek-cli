@@ -2,6 +2,7 @@ import chalk from 'chalk';
 import { CommandRegistry } from './CommandRegistry.js';
 
 export class AutoCompleter {
+  private readonly COMMAND_HINT_COLOR = chalk.hex('#D6F54A');
   private commandRegistry: CommandRegistry;
   private currentSuggestions: string[] = [];
   private suggestionIndex = -1;
@@ -85,8 +86,8 @@ export class AutoCompleter {
       const desc = this.truncateToWidth(descBase, descWidth);
 
       const marker = isActive ? chalk.white('> ') : chalk.dim('  ');
-      const commandText = isActive ? chalk.blueBright(rawCommand) : chalk.gray(rawCommand);
-      const descText = isActive ? chalk.rgb(192, 200, 255)(desc) : chalk.dim(desc);
+      const commandText = isActive ? this.COMMAND_HINT_COLOR(rawCommand) : chalk.gray(rawCommand);
+      const descText = isActive ? this.COMMAND_HINT_COLOR(desc) : chalk.dim(desc);
       lines.push(` ${marker}${commandText}${descText}`);
     });
 

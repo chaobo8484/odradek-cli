@@ -1,19 +1,32 @@
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
+import { createElement } from 'react';
 import chalk from 'chalk';
 import boxen from 'boxen';
 import { ConversationManager } from './ConversationManager.js';
 import { UIRenderer } from './UIRenderer.js';
 import { CommandRegistry } from './CommandRegistry.js';
-import { ConfigStore } from './ConfigStore.js';
+import { ConfigStore, ConfigValueSource, ProviderConfigSources } from './ConfigStore.js';
 import { Spinner } from './Spinner.js';
-import { PromptAssetCategory, PromptAssetScanner } from './PromptAssetScanner.js';
+import { PromptAssetCategory, PromptAssetScanner, PromptScanResult } from './PromptAssetScanner.js';
+import { ExtractedRule, RuleScanner, RulesFile, RulesScanResult } from './RuleScanner.js';
 import { SkillScanner, SkillScanResult, SkillSummary } from './SkillScanner.js';
 import { ContextNoiseAnalysis, ContextNoiseAnalyzer, ContextNoiseReadRecord } from './ContextNoiseAnalyzer.js';
+import { NoiseCoverageRow, NoiseDimensionReport, NoiseEvaluationReport, NoiseEvaluator } from './NoiseEvaluator.js';
 import { TodoGranularityAnalysis, TodoGranularityAnalyzer } from './TodoGranularityAnalyzer.js';
 import { estimateTokenCount } from './tokenEstimate.js';
+import { NoiseEvaluationScreen } from './ink/NoiseEvaluationScreen.js';
+import { ContextHealthScreen } from './ink/ContextHealthScreen.js';
+import { ScanPromptScreen } from './ink/ScanPromptScreen.js';
+import { RulesScanScreen } from './ink/RulesScanScreen.js';
+import { SkillsOverviewScreen } from './ink/SkillsOverviewScreen.js';
+import { StateScreen } from './ink/StateScreen.js';
+import { TodoGranularityScreen } from './ink/TodoGranularityScreen.js';
+import { TokenStructureScreen } from './ink/TokenStructureScreen.js';
+import { renderStaticInkScreen } from './ink/renderInkScreen.js';
 import { ClaudeTokenizer } from '../llm/ClaudeTokenizer.js';
+import { getProviderMeta } from '../config/providerCatalog.js';
 
 type ContextAnatomySegmentKey = 'system' | 'prompt_library' | 'reference_docs' | 'chat_history' | 'active_request';
 
@@ -129,18 +142,44 @@ type ContextUsageRecord = {
   cacheReadTokens: number;
 };
 
+type ContextUsageMetrics = {
+  source: 'native' | 'calculated';
+  rawPercent: number;
+  effectivePercent: number;
+  usedTokens: number;
+  usageTokens: number;
+  usageDerivedPercent: number;
+  nativePercent: number | null;
+  percentDrift: number | null;
+  windowSource: 'explicit' | 'estimated';
+  contextWindowTokens: number;
+  usableContextTokens: number;
+  autocompactBufferTokens: number;
+};
+
 type ContextHealthSnapshot = {
   level: ContextHealthLevel;
   levelReason: string;
   confidence: ContextHealthConfidence;
   confidenceReason: string;
   source: 'native' | 'calculated';
+  windowSource: 'explicit' | 'estimated';
   model: string;
   rawPercent: number;
+  usageDerivedPercent: number;
+  nativePercent: number | null;
+  percentDrift: number | null;
   effectivePercent: number;
   smoothedEffectivePercent: number;
   trendDeltaPercent: number | null;
   dataPoints: number;
+  comparableDataPoints: number;
+  nativeSampleCount: number;
+  calculatedSampleCount: number;
+  explicitWindowSampleCount: number;
+  estimatedWindowSampleCount: number;
+  mixedModels: boolean;
+  mixedContextWindows: boolean;
   usedTokens: number;
   contextWindowTokens: number;
   usableContextTokens: number;
@@ -148,6 +187,7 @@ type ContextHealthSnapshot = {
   inputTokens: number;
   cacheCreationTokens: number;
   cacheReadTokens: number;
+  timestampMs: number;
   timestampLabel: string;
   filePath: string;
 };
@@ -197,6 +237,13 @@ type PromptScanTokenizationStrategy = {
   getWarning: () => string | undefined;
 };
 
+type PromptScanPresentation = {
+  modeLabel: string;
+  warning?: string;
+  result: PromptScanResult;
+  anatomyView: ContextAnatomyView;
+};
+
 export class CommandHandler {
   private static readonly ANATOMY_BAR_WIDTH = 28;
   private static readonly MAX_CLAUDE_HISTORY_FILES = 6;
@@ -213,6 +260,7 @@ export class CommandHandler {
   private static readonly CONTEXT_HEALTH_RECENT_RECORDS = 8;
   private static readonly CONTEXT_HEALTH_MAX_RECORDS_PER_FILE = 3;
   private static readonly SCAN_PROMPT_TIMEOUT_MS = 5 * 60 * 1000;
+  private readonly COMMAND_HINT_COLOR = chalk.hex('#D6F54A');
   private conversationManager: ConversationManager;
   private uiRenderer: UIRenderer;
   private commandRegistry: CommandRegistry;
@@ -224,8 +272,10 @@ export class CommandHandler {
   private onTrustCurrentPath: () => Promise<void>;
   private onTrustCheckCurrentPath: () => Promise<void>;
   private promptAssetScanner: PromptAssetScanner;
+  private ruleScanner: RuleScanner;
   private skillScanner: SkillScanner;
   private contextNoiseAnalyzer: ContextNoiseAnalyzer;
+  private noiseEvaluator: NoiseEvaluator;
   private claudeTokenizer: ClaudeTokenizer;
 
   constructor(
@@ -249,8 +299,10 @@ export class CommandHandler {
     this.onTrustCurrentPath = onTrustCurrentPath;
     this.onTrustCheckCurrentPath = onTrustCheckCurrentPath;
     this.promptAssetScanner = new PromptAssetScanner();
+    this.ruleScanner = new RuleScanner();
     this.skillScanner = new SkillScanner();
     this.contextNoiseAnalyzer = new ContextNoiseAnalyzer();
+    this.noiseEvaluator = new NoiseEvaluator();
     this.configStore = new ConfigStore();
     this.claudeTokenizer = new ClaudeTokenizer(this.configStore);
   }
@@ -280,6 +332,9 @@ export class CommandHandler {
     switch (resolvedCommand) {
       case 'help':
         this.showHelp();
+        break;
+      case 'state':
+        await this.showProjectState();
         break;
       case 'clear':
         this.clearConversation();
@@ -330,6 +385,11 @@ export class CommandHandler {
       case 'scanprompt':
         await this.scanPromptAssets();
         break;
+      case 'rules':
+      case 'scan_rules':
+      case 'rulecheck':
+        await this.scanRules(args);
+        break;
       case 'scan_tokens':
       case 'scantokens':
       case 'tokenscan':
@@ -343,6 +403,8 @@ export class CommandHandler {
       case 'context_noise':
       case 'ctxnoise':
       case 'contextnoise':
+      case 'noise_eval':
+      case 'noise':
         await this.analyzeContextNoise(args);
         break;
       case 'todo_granularity':
@@ -363,13 +425,148 @@ export class CommandHandler {
     const commands = this.commandRegistry.getAllCommands();
     commands.forEach((cmd) => {
       const usage = cmd.usage || `/${cmd.name}`;
-      console.log(chalk.dim('  - ') + chalk.cyan(usage) + chalk.dim('  ') + chalk.gray(cmd.description));
+      console.log(chalk.dim('  - ') + this.COMMAND_HINT_COLOR(usage) + chalk.dim('  ') + chalk.gray(cmd.description));
     });
 
     console.log('');
     console.log(chalk.dim('  Tip: type / and press Tab to autocomplete commands'));
     console.log('');
     this.recordCommandData('help', `Listed ${commands.length} commands.`);
+  }
+
+  private async showProjectState(): Promise<void> {
+    const currentPath = process.cwd();
+
+    try {
+      const [config, diagnostics, trusted] = await Promise.all([
+        this.configStore.getConfig(),
+        this.configStore.getConfigDiagnostics(),
+        this.configStore.isPathTrusted(currentPath),
+      ]);
+
+      const activeProvider = config.activeProvider;
+      const providerMeta = getProviderMeta(activeProvider);
+      const providerConfig = config.providers[activeProvider] ?? {};
+      const providerSources = diagnostics.providerSources[activeProvider];
+      const apiKeyConfigured = Boolean(providerConfig.apiKey?.trim());
+      const modelValue = providerConfig.model?.trim() || 'Not set';
+      const endpointValue = providerConfig.baseUrl?.trim() || providerMeta.defaultBaseUrl;
+      const runtimeStatus = apiKeyConfigured && providerConfig.model?.trim() ? 'ready' : 'needs setup';
+      const sessionOverrides = this.getSessionOverrideLabels(providerSources);
+      const envFiles = diagnostics.loadedEnvFiles.length > 0 ? diagnostics.loadedEnvFiles.join(', ') : 'none loaded';
+      const projectContextSourceLabel = this.describeConfigValueSource(diagnostics.projectContextEnabledSource);
+      const apiKeySourceLabel = this.describeConfigValueSource(providerSources.apiKey);
+      const modelSourceLabel = this.describeConfigValueSource(providerSources.model);
+      const endpointSourceLabel = this.describeConfigValueSource(providerSources.baseUrl);
+
+      try {
+        await renderStaticInkScreen(
+          createElement(StateScreen, {
+            scopeLabel: 'current_project',
+            workspacePath: currentPath,
+            configPath: this.configStore.getConfigPath(),
+            trusted,
+            runtimeStatus,
+            providerDisplayName: providerMeta.displayName,
+            providerSourceLabel: this.describeConfigValueSource(diagnostics.activeProviderSource),
+            runtimeSourceLabel: this.summarizeProviderConfigSource(providerSources),
+            projectContextEnabled: config.projectContextEnabled,
+            projectContextSourceLabel,
+            apiKeyConfigured,
+            apiKeySourceLabel,
+            modelValue,
+            modelSourceLabel,
+            endpointValue,
+            endpointSourceLabel,
+            envFilesLabel: envFiles,
+            envFilesLoaded: diagnostics.loadedEnvFiles.length > 0,
+            sessionOverrides,
+          })
+        );
+      } catch {
+        const lines = [
+          this.formatStateLine('Workspace', this.formatPathForState(currentPath)),
+          this.formatStateLine('Trust', trusted ? 'trusted' : 'not trusted', trusted ? 'success' : 'warning'),
+          this.formatStateLine('Config file', this.formatPathForState(this.configStore.getConfigPath()), 'muted'),
+          '',
+          this.formatStateLine('Status', runtimeStatus, runtimeStatus === 'ready' ? 'success' : 'warning'),
+          this.formatStateLine(
+            'Provider',
+            providerMeta.displayName,
+            'default',
+            this.describeConfigValueSource(diagnostics.activeProviderSource)
+          ),
+          this.formatStateLine('Source', this.summarizeProviderConfigSource(providerSources), 'accent'),
+          this.formatStateLine(
+            'Project ctx',
+            config.projectContextEnabled ? 'enabled' : 'disabled',
+            config.projectContextEnabled ? 'success' : 'warning',
+            projectContextSourceLabel
+          ),
+          this.formatStateLine(
+            'API key',
+            apiKeyConfigured ? 'configured' : 'missing',
+            apiKeyConfigured ? 'success' : 'warning',
+            apiKeySourceLabel
+          ),
+          this.formatStateLine(
+            'Model',
+            modelValue,
+            providerConfig.model?.trim() ? 'default' : 'warning',
+            modelSourceLabel
+          ),
+          this.formatStateLine('Endpoint', endpointValue, 'muted', endpointSourceLabel),
+          this.formatStateLine('Env files', envFiles, diagnostics.loadedEnvFiles.length > 0 ? 'accent' : 'muted'),
+        ];
+
+        if (sessionOverrides.length > 0) {
+          lines.push(this.formatStateLine('Session', sessionOverrides.join(', '), 'success'));
+        }
+
+        if (!trusted) {
+          lines.push(this.formatStateLine('Hint', 'Run /trustpath to trust this directory', 'accent'));
+        }
+
+        console.log('');
+        console.log(
+          boxen(lines.join('\n'), {
+            title: ' Project State ',
+            titleAlignment: 'center',
+            borderStyle: 'round',
+            borderColor: 'cyan',
+            padding: { top: 0, bottom: 0, left: 1, right: 1 },
+          })
+        );
+        console.log('');
+      }
+
+      this.recordCommandData(
+        'state',
+        [
+          `workspace=${currentPath}`,
+          `trusted=${trusted}`,
+          `configPath=${this.configStore.getConfigPath()}`,
+          `status=${runtimeStatus}`,
+          `provider=${activeProvider}`,
+          `providerSource=${diagnostics.activeProviderSource}`,
+          `runtimeSource=${this.summarizeProviderConfigSource(providerSources)}`,
+          `projectContext=${config.projectContextEnabled}`,
+          `projectContextSource=${diagnostics.projectContextEnabledSource}`,
+          `apiKeyConfigured=${apiKeyConfigured}`,
+          `apiKeySource=${providerSources.apiKey}`,
+          `model=${modelValue}`,
+          `modelSource=${providerSources.model}`,
+          `endpoint=${endpointValue}`,
+          `endpointSource=${providerSources.baseUrl}`,
+          `envFiles=${envFiles}`,
+          `sessionOverrides=${sessionOverrides.join(', ') || '(none)'}`,
+        ].join('\n')
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to read project state';
+      this.uiRenderer.renderError(message);
+      this.recordCommandData('state', `failed: ${message}`);
+    }
   }
 
   private clearConversation(): void {
@@ -469,7 +666,7 @@ export class CommandHandler {
         this.uiRenderer.renderSuccess('Token scan completed');
       }
 
-      this.renderTokenStructureSummary(target, summary);
+      await this.renderTokenStructureSummary(target, summary);
       const topFields = summary.tokenFields
         .slice(0, 6)
         .map((field) => `${field.name}:${Math.round(field.total)}`)
@@ -554,7 +751,7 @@ export class CommandHandler {
         this.uiRenderer.renderSuccess('Context health check completed');
       }
 
-      this.renderContextHealthSnapshot(target, snapshot);
+      await this.renderContextHealthSnapshot(target, snapshot);
       this.recordCommandData(
         'context_health',
         [
@@ -563,10 +760,19 @@ export class CommandHandler {
           `level=${snapshot.level}`,
           `confidence=${snapshot.confidence}`,
           `samples=${snapshot.dataPoints}`,
+          `comparableSamples=${snapshot.comparableDataPoints}`,
+          `nativeSamples=${snapshot.nativeSampleCount}`,
+          `calculatedSamples=${snapshot.calculatedSampleCount}`,
+          `explicitWindowSamples=${snapshot.explicitWindowSampleCount}`,
+          `estimatedWindowSamples=${snapshot.estimatedWindowSampleCount}`,
+          `mixedModels=${snapshot.mixedModels}`,
+          `mixedContextWindows=${snapshot.mixedContextWindows}`,
           `effectivePercent=${snapshot.effectivePercent.toFixed(2)}`,
           `smoothedEffectivePercent=${snapshot.smoothedEffectivePercent.toFixed(2)}`,
           `trendDeltaPercent=${snapshot.trendDeltaPercent === null ? 'n/a' : snapshot.trendDeltaPercent.toFixed(2)}`,
           `rawPercent=${snapshot.rawPercent.toFixed(2)}`,
+          `usageDerivedPercent=${snapshot.usageDerivedPercent.toFixed(2)}`,
+          `percentDrift=${snapshot.percentDrift === null ? 'n/a' : snapshot.percentDrift.toFixed(2)}`,
           `usedTokens=${Math.round(snapshot.usedTokens)}`,
           `windowTokens=${snapshot.contextWindowTokens}`,
           `model=${snapshot.model}`,
@@ -587,9 +793,9 @@ export class CommandHandler {
   private async analyzeContextNoise(args: string[]): Promise<void> {
     const spinner = process.stdout.isTTY ? new Spinner() : null;
     if (spinner) {
-      spinner.start('Analyzing context noise from Claude sessions...');
+      spinner.start('Running formal noise evaluation from Claude sessions...');
     } else {
-      this.uiRenderer.renderInfo('Analyzing context noise from Claude sessions...');
+      this.uiRenderer.renderInfo('Running formal noise evaluation from Claude sessions...');
     }
 
     try {
@@ -597,58 +803,244 @@ export class CommandHandler {
       const target = await this.resolveTokenScanTarget(request);
       if (target.filePaths.length === 0) {
         if (spinner) {
-          spinner.stop('Context noise analysis completed');
+          spinner.stop('Noise evaluation completed');
         } else {
-          this.uiRenderer.renderSuccess('Context noise analysis completed');
+          this.uiRenderer.renderSuccess('Noise evaluation completed');
         }
-        this.uiRenderer.renderWarning('No Claude session JSONL files found for context noise analysis');
+        this.uiRenderer.renderWarning('No Claude session JSONL files found for noise evaluation');
         this.recordCommandData(
-          'context_noise',
+          'noise_eval',
           [`scope=${target.scopeLabel}`, `source=${target.sourceLabel}`, 'jsonlFiles=0'].join('\n')
         );
         return;
       }
 
-      const analysis = await this.contextNoiseAnalyzer.analyze(
+      const report = await this.noiseEvaluator.analyze(
         target.filePaths.map((filePath) => ({
           sessionId: path.basename(filePath, path.extname(filePath)),
           filePath,
-        }))
+        })),
+        {
+          workspaceHint: request.scope === 'current' ? path.resolve(process.cwd()) : undefined,
+        }
       );
-      const coverage = await this.buildPromptCoverageSummary(analysis);
 
       if (spinner) {
-        spinner.stop('Context noise analysis completed');
+        spinner.stop('Noise evaluation completed');
       } else {
-        this.uiRenderer.renderSuccess('Context noise analysis completed');
+        this.uiRenderer.renderSuccess('Noise evaluation completed');
       }
 
-      this.renderContextNoiseAnalysis(target, analysis, coverage);
+      await this.renderNoiseEvaluation(target, report);
       this.recordCommandData(
-        'context_noise',
+        'noise_eval',
         [
           `scope=${target.scopeLabel}`,
           `source=${target.sourceLabel}`,
           `jsonlFiles=${target.filePaths.length}`,
-          `sessionsAnalyzed=${analysis.sessionsAnalyzed}`,
-          `sessionsWithSignals=${analysis.sessionsWithSignals}`,
-          `events=${analysis.events.length}`,
-          `promptAssetsRead=${coverage.readAssets.length}`,
-          `promptAssetsUnread=${coverage.unreadAssets.length}`,
-          `estimatedTokens=${Math.round(analysis.totalEstimatedTokens)}`,
-          `noiseTokens=${Math.round(analysis.totalNoiseTokens)}`,
-          `topCategory=${analysis.categories[0]?.label ?? '(none)'}`,
+          `sessionsAnalyzed=${report.sessionsAnalyzed}`,
+          `coverageGrade=${report.coverageGrade}`,
+          `workspaceRoot=${report.workspaceRoot || 'n/a'}`,
+          `estimatedTokens=${Math.round(report.totalEstimatedTokens)}`,
+          `toolCalls=${report.totalToolCalls}`,
+          `outcome=${report.dimensions.find((dimension) => dimension.key === 'outcome')?.status ?? 'n/a'}`,
+          `process=${report.dimensions.find((dimension) => dimension.key === 'process')?.status ?? 'n/a'}`,
+          `context=${report.dimensions.find((dimension) => dimension.key === 'context')?.status ?? 'n/a'}`,
+          `validation=${report.dimensions.find((dimension) => dimension.key === 'validation')?.status ?? 'n/a'}`,
         ].join('\n')
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to analyze context noise';
+      const message = error instanceof Error ? error.message : 'Failed to run noise evaluation';
       if (spinner) {
         spinner.fail(message);
       } else {
         this.uiRenderer.renderError(message);
       }
-      this.recordCommandData('context_noise', `failed: ${message}`);
+      this.recordCommandData('noise_eval', `failed: ${message}`);
     }
+  }
+
+  private async renderNoiseEvaluation(target: TokenScanTarget, report: NoiseEvaluationReport): Promise<void> {
+    try {
+      await renderStaticInkScreen(
+        createElement(NoiseEvaluationScreen, {
+          scopeLabel: target.scopeLabel,
+          sourceLabel: target.sourceLabel,
+          report,
+        })
+      );
+      return;
+    } catch {
+      this.renderNoiseEvaluationFallback(target, report);
+    }
+  }
+
+  private renderNoiseEvaluationFallback(target: TokenScanTarget, report: NoiseEvaluationReport): void {
+    const metaLines: string[] = [
+      `Scope: ${target.scopeLabel} (${target.sourceLabel})`,
+      `Coverage grade: ${this.renderCoverageGrade(report.coverageGrade)}`,
+      `Workspace root: ${report.workspaceRoot || 'n/a'}`,
+      `Sessions analyzed: ${report.sessionsAnalyzed}/${report.sessionsScanned}`,
+      `Estimated tokens: ${this.formatTokenNumber(report.totalEstimatedTokens)} tok`,
+      `Tool calls: ${this.formatTokenNumber(report.totalToolCalls)}`,
+    ];
+
+    console.log(
+      boxen(metaLines.join('\n'), {
+        borderStyle: 'round',
+        borderColor: report.coverageGrade === 'A' ? 'green' : report.coverageGrade === 'B' ? 'yellow' : 'red',
+        title: ' Noise Evaluation ',
+        titleAlignment: 'left',
+        padding: { top: 0, right: 1, bottom: 0, left: 1 },
+      })
+    );
+
+    console.log('');
+    console.log(chalk.bold('  Evidence Coverage'));
+    report.coverage.forEach((row) => {
+      const availability = row.available ? chalk.green('yes') : chalk.red('no');
+      const reliability =
+        row.reliability === 'high'
+          ? chalk.green(row.reliability)
+          : row.reliability === 'medium'
+          ? chalk.yellow(row.reliability)
+          : chalk.red(row.reliability);
+      const sources = row.sources.length > 0 ? row.sources.join(', ') : 'n/a';
+      console.log(`  ${row.dimension.padEnd(11, ' ')} ${availability.padEnd?.(3, ' ') ?? availability}  ${reliability}  ${sources}`);
+      console.log(chalk.dim(`      ${row.notes}`));
+    });
+
+    console.log('');
+    console.log(chalk.bold('  Feasible Scope'));
+    report.feasibleScope.forEach((item) => {
+      console.log(chalk.dim('  - ') + item);
+    });
+
+    for (const dimension of report.dimensions) {
+      console.log('');
+      this.renderNoiseDimension(dimension);
+    }
+
+    if (report.git && report.git.files.length > 0) {
+      console.log('');
+      console.log(chalk.bold('  Current Diff'));
+      report.git.files.slice(0, 8).forEach((file) => {
+        const status = this.colorizeNoiseStatus(
+          file.attributed === false || file.generatedLike ? 'watch' : 'ok',
+          file.status
+        );
+        const lineText =
+          file.addedLines === null && file.deletedLines === null
+            ? 'n/a'
+            : `+${file.addedLines ?? 0} -${file.deletedLines ?? 0}`;
+        const attribution =
+          file.attributed === true ? chalk.green('attributed') : file.attributed === false ? chalk.yellow('unattributed') : chalk.dim('n/a');
+        console.log(`  ${status.padEnd?.(10, ' ') ?? status} ${this.truncateBlockName(file.path, 54).padEnd(54, ' ')} ${lineText.padStart(12, ' ')}  ${attribution}`);
+      });
+    }
+
+    if (report.fileHotspots.length > 0) {
+      console.log('');
+      console.log(chalk.bold('  File Hotspots'));
+      report.fileHotspots.slice(0, 8).forEach((hotspot) => {
+        console.log(
+          `  ${this.truncateBlockName(hotspot.path, 52).padEnd(52, ' ')} ${String(hotspot.reads).padStart(4, ' ')} reads ${String(
+            hotspot.duplicateReads
+          ).padStart(4, ' ')} dup ${this.formatTokenNumber(hotspot.tokens).padStart(8, ' ')} tok`
+        );
+      });
+    }
+
+    if (report.nextActions.length > 0) {
+      console.log('');
+      console.log(chalk.bold('  Next Actions'));
+      report.nextActions.forEach((action) => {
+        console.log(chalk.dim('  - ') + action);
+      });
+    }
+
+    if (report.warnings.length > 0) {
+      console.log('');
+      console.log(chalk.bold('  Warnings'));
+      report.warnings.forEach((warning) => {
+        console.log(chalk.dim('  - ') + chalk.yellow(warning));
+      });
+    }
+  }
+
+  private renderNoiseDimension(dimension: NoiseDimensionReport): void {
+    const title = `${dimension.label} | ${dimension.status.toUpperCase()} | confidence ${dimension.confidence}`;
+    console.log(chalk.bold(`  ${title}`));
+    console.log(chalk.dim(`  ${dimension.summary}`));
+
+    if (dimension.metrics.length > 0) {
+      console.log(chalk.bold('  Metrics'));
+      dimension.metrics.forEach((metric) => {
+        const status = this.colorizeNoiseStatus(metric.status, metric.status.toUpperCase());
+        console.log(`  ${status.padEnd?.(8, ' ') ?? status} ${metric.label.padEnd(28, ' ')} ${metric.value}`);
+        console.log(chalk.dim(`      ${metric.summary} [${metric.trust}]`));
+        if (metric.missingEvidence.length > 0) {
+          console.log(chalk.dim(`      missing: ${metric.missingEvidence.join(', ')}`));
+        }
+      });
+    }
+
+    if (dimension.observedFacts.length > 0) {
+      console.log(chalk.bold('  Observed Facts'));
+      dimension.observedFacts.forEach((fact) => {
+        console.log(chalk.dim('  - ') + fact);
+      });
+    }
+
+    if (dimension.derivedFeatures.length > 0) {
+      console.log(chalk.bold('  Derived Features'));
+      dimension.derivedFeatures.forEach((feature) => {
+        console.log(chalk.dim('  - ') + feature);
+      });
+    }
+
+    if (dimension.semanticJudgments.length > 0) {
+      console.log(chalk.bold('  Semantic Judgments'));
+      dimension.semanticJudgments.forEach((item) => {
+        console.log(chalk.dim('  - ') + item);
+      });
+    }
+
+    if (dimension.signals.length > 0) {
+      console.log(chalk.bold(`  Top Signals (${Math.min(4, dimension.signals.length)})`));
+      dimension.signals.slice(0, 4).forEach((signal) => {
+        const status = this.colorizeNoiseStatus(signal.status, signal.status.toUpperCase());
+        console.log(
+          `  ${status.padEnd?.(8, ' ') ?? status} ${this.truncateBlockName(signal.target || '(unknown)', 48).padEnd(48, ' ')} ${this.formatTokenNumber(
+            signal.tokenImpact
+          ).padStart(8, ' ')} tok`
+        );
+        console.log(chalk.dim(`      ${signal.summary}`));
+      });
+    }
+  }
+
+  private renderCoverageGrade(grade: NoiseEvaluationReport['coverageGrade']): string {
+    if (grade === 'A') {
+      return chalk.green(grade);
+    }
+    if (grade === 'B') {
+      return chalk.yellow(grade);
+    }
+    return chalk.red(grade);
+  }
+
+  private colorizeNoiseStatus(status: 'ok' | 'watch' | 'high' | 'na', label: string): string {
+    if (status === 'ok') {
+      return chalk.green(label);
+    }
+    if (status === 'watch') {
+      return chalk.yellow(label);
+    }
+    if (status === 'high') {
+      return chalk.red(label);
+    }
+    return chalk.gray(label);
   }
 
   private async analyzeTodoGranularity(args: string[]): Promise<void> {
@@ -691,7 +1083,7 @@ export class CommandHandler {
         this.uiRenderer.renderSuccess('Todo granularity analysis completed');
       }
 
-      this.renderTodoGranularityAnalysis(target, analysis);
+      await this.renderTodoGranularityAnalysis(target, analysis);
       this.recordCommandData(
         'todo_granularity',
         [
@@ -719,7 +1111,22 @@ export class CommandHandler {
     }
   }
 
-  private renderTodoGranularityAnalysis(target: TokenScanTarget, analysis: TodoGranularityAnalysis): void {
+  private async renderTodoGranularityAnalysis(target: TokenScanTarget, analysis: TodoGranularityAnalysis): Promise<void> {
+    try {
+      await renderStaticInkScreen(
+        createElement(TodoGranularityScreen, {
+          scopeLabel: target.scopeLabel,
+          sourceLabel: target.sourceLabel,
+          analysis,
+        })
+      );
+      return;
+    } catch {
+      this.renderTodoGranularityAnalysisFallback(target, analysis);
+    }
+  }
+
+  private renderTodoGranularityAnalysisFallback(target: TokenScanTarget, analysis: TodoGranularityAnalysis): void {
     const headerLines = [
       `Scope: ${target.scopeLabel}`,
       `Source: ${target.sourceLabel}`,
@@ -958,22 +1365,50 @@ export class CommandHandler {
   }
 
   private buildContextHealthSnapshot(records: ContextUsageRecord[]): ContextHealthSnapshot {
-    const latestRecord = records[0];
-    const latestMetrics = this.calculateContextUsageMetrics(latestRecord);
-    const metricsWindow = records.slice(0, 3).map((record) => this.calculateContextUsageMetrics(record));
+    const metricsByRecord = records.map((record) => ({
+      record,
+      metrics: this.calculateContextUsageMetrics(record),
+    }));
+    const latestPair = metricsByRecord[0];
+    const latestRecord = latestPair.record;
+    const latestMetrics = latestPair.metrics;
+    const latestComparableKey = this.buildContextUsageComparableKey(latestRecord, latestMetrics);
+    const comparablePairs =
+      latestComparableKey === null
+        ? [latestPair]
+        : metricsByRecord.filter(
+            ({ record, metrics }) => this.buildContextUsageComparableKey(record, metrics) === latestComparableKey
+          );
+    const comparableMetricsWindow = comparablePairs.slice(0, 3).map((item) => item.metrics);
     const smoothedEffectivePercent =
-      metricsWindow.length > 0
-        ? metricsWindow.reduce((sum, item) => sum + item.effectivePercent, 0) / metricsWindow.length
+      comparableMetricsWindow.length > 0
+        ? comparableMetricsWindow.reduce((sum, item) => sum + item.effectivePercent, 0) / comparableMetricsWindow.length
         : latestMetrics.effectivePercent;
     const trendDeltaPercent =
-      records.length > 1
-        ? latestMetrics.effectivePercent - this.calculateContextUsageMetrics(records[1]).effectivePercent
+      comparableMetricsWindow.length > 1
+        ? latestMetrics.effectivePercent - comparableMetricsWindow[1].effectivePercent
         : null;
+    const knownModels = new Set(
+      records.map((record) => this.normalizeContextHealthModel(record.model)).filter((model) => model !== 'unknown')
+    );
+    const windowValues = new Set(metricsByRecord.map(({ metrics }) => metrics.contextWindowTokens));
+    const nativeSampleCount = metricsByRecord.filter(({ metrics }) => metrics.source === 'native').length;
+    const explicitWindowSampleCount = metricsByRecord.filter(({ metrics }) => metrics.windowSource === 'explicit').length;
 
-    // Use both immediate and smoothed values to reduce one-off spikes.
-    const levelSignal = Math.max(latestMetrics.effectivePercent, smoothedEffectivePercent);
+    // Use both immediate and smoothed values to reduce one-off spikes, but only across comparable samples.
+    const levelSignal =
+      comparableMetricsWindow.length >= 2
+        ? Math.max(latestMetrics.effectivePercent, smoothedEffectivePercent)
+        : latestMetrics.effectivePercent;
     const levelOutcome = this.resolveContextHealthLevel(levelSignal);
-    const confidenceOutcome = this.resolveContextHealthConfidence(latestRecord, latestMetrics, records.length);
+    const confidenceOutcome = this.resolveContextHealthConfidence(
+      latestRecord,
+      latestMetrics,
+      records.length,
+      comparablePairs.length,
+      knownModels.size > 1,
+      windowValues.size > 1
+    );
 
     return {
       level: levelOutcome.level,
@@ -981,12 +1416,23 @@ export class CommandHandler {
       confidence: confidenceOutcome.confidence,
       confidenceReason: confidenceOutcome.reason,
       source: latestMetrics.source,
+      windowSource: latestMetrics.windowSource,
       model: latestRecord.model,
       rawPercent: latestMetrics.rawPercent,
+      usageDerivedPercent: latestMetrics.usageDerivedPercent,
+      nativePercent: latestMetrics.nativePercent,
+      percentDrift: latestMetrics.percentDrift,
       effectivePercent: latestMetrics.effectivePercent,
       smoothedEffectivePercent,
       trendDeltaPercent,
       dataPoints: records.length,
+      comparableDataPoints: comparablePairs.length,
+      nativeSampleCount,
+      calculatedSampleCount: records.length - nativeSampleCount,
+      explicitWindowSampleCount,
+      estimatedWindowSampleCount: records.length - explicitWindowSampleCount,
+      mixedModels: knownModels.size > 1,
+      mixedContextWindows: windowValues.size > 1,
       usedTokens: latestMetrics.usedTokens,
       contextWindowTokens: latestMetrics.contextWindowTokens,
       usableContextTokens: latestMetrics.usableContextTokens,
@@ -994,20 +1440,13 @@ export class CommandHandler {
       inputTokens: latestRecord.inputTokens,
       cacheCreationTokens: latestRecord.cacheCreationTokens,
       cacheReadTokens: latestRecord.cacheReadTokens,
+      timestampMs: latestRecord.timestampMs,
       timestampLabel: latestRecord.timestampLabel,
       filePath: latestRecord.filePath,
     };
   }
 
-  private calculateContextUsageMetrics(record: ContextUsageRecord): {
-    source: 'native' | 'calculated';
-    rawPercent: number;
-    effectivePercent: number;
-    usedTokens: number;
-    contextWindowTokens: number;
-    usableContextTokens: number;
-    autocompactBufferTokens: number;
-  } {
+  private calculateContextUsageMetrics(record: ContextUsageRecord): ContextUsageMetrics {
     const estimatedWindow = this.estimateContextWindowTokens(record.model);
     const contextWindowTokens = record.contextWindowTokens ?? estimatedWindow;
     const autocompactBufferTokens = Math.round(contextWindowTokens * CommandHandler.AUTOCOMPACT_BUFFER_RATIO);
@@ -1020,11 +1459,8 @@ export class CommandHandler {
     const rawPercent = rawPercentFromNative ?? rawPercentFromUsage;
 
     const usedTokensFromNative =
-      rawPercentFromNative !== null ? Math.round((rawPercentFromNative / 100) * contextWindowTokens) : 0;
-    let usedTokens =
-      rawPercentFromNative !== null
-        ? Math.max(usedTokensFromNative, usageTokens)
-        : usageTokens;
+      rawPercentFromNative !== null ? Math.round((rawPercentFromNative / 100) * contextWindowTokens) : null;
+    let usedTokens = usedTokensFromNative ?? usageTokens;
 
     if (usedTokens <= 0 && rawPercent > 0) {
       usedTokens = Math.round((rawPercent / 100) * contextWindowTokens);
@@ -1036,6 +1472,12 @@ export class CommandHandler {
       rawPercent,
       effectivePercent,
       usedTokens,
+      usageTokens,
+      usageDerivedPercent: rawPercentFromUsage,
+      nativePercent: rawPercentFromNative,
+      percentDrift:
+        rawPercentFromNative !== null ? Math.abs(rawPercentFromNative - rawPercentFromUsage) : null,
+      windowSource: record.contextWindowTokens !== null ? 'explicit' : 'estimated',
       contextWindowTokens,
       usableContextTokens,
       autocompactBufferTokens,
@@ -1044,8 +1486,11 @@ export class CommandHandler {
 
   private resolveContextHealthConfidence(
     latestRecord: ContextUsageRecord,
-    latestMetrics: { source: 'native' | 'calculated'; contextWindowTokens: number },
-    sampleCount: number
+    latestMetrics: ContextUsageMetrics,
+    sampleCount: number,
+    comparableSampleCount: number,
+    mixedModels: boolean,
+    mixedContextWindows: boolean
   ): { confidence: ContextHealthConfidence; reason: string } {
     let score = 0;
     const reasons: string[] = [];
@@ -1064,12 +1509,14 @@ export class CommandHandler {
       reasons.push(`context window estimated (${this.formatTokenNumber(latestMetrics.contextWindowTokens)} tokens)`);
     }
 
-    if (sampleCount >= 3) {
+    if (comparableSampleCount >= 3) {
       score += 1;
-      reasons.push(`trend based on ${sampleCount} samples`);
-    } else if (sampleCount === 2) {
+      reasons.push(`trend based on ${comparableSampleCount} comparable samples`);
+    } else if (comparableSampleCount === 2) {
       score += 0;
-      reasons.push('limited trend history');
+      reasons.push('limited comparable trend history');
+    } else if (sampleCount > 1) {
+      reasons.push('recent samples are not directly comparable for trend');
     } else {
       score -= 1;
       reasons.push('single-sample snapshot');
@@ -1082,6 +1529,28 @@ export class CommandHandler {
       reasons.push('model not identified');
     }
 
+    if (mixedModels) {
+      score -= 1;
+      reasons.push('recent samples mix multiple models');
+    }
+
+    if (mixedContextWindows) {
+      score -= 1;
+      reasons.push('recent samples mix multiple context windows');
+    }
+
+    if (latestMetrics.percentDrift !== null) {
+      if (latestMetrics.percentDrift >= 15) {
+        score -= 2;
+        reasons.push(`native vs usage-token estimate diverges by ${latestMetrics.percentDrift.toFixed(1)} pts`);
+      } else if (latestMetrics.percentDrift >= 5) {
+        score -= 1;
+        reasons.push(`native vs usage-token estimate drifts by ${latestMetrics.percentDrift.toFixed(1)} pts`);
+      } else {
+        reasons.push('native and usage-token estimates are aligned');
+      }
+    }
+
     const nowMs = Date.now();
     const ageMs = Math.max(0, nowMs - latestRecord.timestampMs);
     const ageHours = ageMs / (1000 * 60 * 60);
@@ -1092,6 +1561,20 @@ export class CommandHandler {
 
     const confidence: ContextHealthConfidence = score >= 4 ? 'high' : score >= 2 ? 'medium' : 'low';
     return { confidence, reason: reasons.join('; ') };
+  }
+
+  private buildContextUsageComparableKey(record: ContextUsageRecord, metrics: ContextUsageMetrics): string | null {
+    const modelKey = this.normalizeContextHealthModel(record.model);
+    if (modelKey === 'unknown') {
+      return null;
+    }
+
+    return `${modelKey}::${metrics.contextWindowTokens}`;
+  }
+
+  private normalizeContextHealthModel(model: string): string {
+    const normalized = model.trim().toLowerCase();
+    return normalized || 'unknown';
   }
 
   private resolveContextHealthLevel(effectivePercent: number): { level: ContextHealthLevel; levelReason: string } {
@@ -1110,7 +1593,22 @@ export class CommandHandler {
     return { level: 'healthy', levelReason: 'context usage is in a safe range' };
   }
 
-  private renderContextHealthSnapshot(target: TokenScanTarget, snapshot: ContextHealthSnapshot): void {
+  private async renderContextHealthSnapshot(target: TokenScanTarget, snapshot: ContextHealthSnapshot): Promise<void> {
+    try {
+      await renderStaticInkScreen(
+        createElement(ContextHealthScreen, {
+          scopeLabel: target.scopeLabel,
+          sourceLabel: target.sourceLabel,
+          snapshot,
+        })
+      );
+      return;
+    } catch {
+      this.renderContextHealthSnapshotFallback(target, snapshot);
+    }
+  }
+
+  private renderContextHealthSnapshotFallback(target: TokenScanTarget, snapshot: ContextHealthSnapshot): void {
     const levelText =
       snapshot.level === 'critical'
         ? chalk.red('CRITICAL')
@@ -1127,12 +1625,27 @@ export class CommandHandler {
         : chalk.red('LOW');
 
     const rawBar = this.renderPercentBar(snapshot.rawPercent, chalk.blue);
+    const usageEstimateBar = this.renderPercentBar(snapshot.usageDerivedPercent, chalk.magenta);
     const effectiveBar = this.renderPercentBar(snapshot.effectivePercent, this.colorizeLevel(snapshot.level));
     const smoothedBar = this.renderPercentBar(snapshot.smoothedEffectivePercent, this.colorizeLevel(snapshot.level));
     const fileLabel = this.truncateBlockName(snapshot.filePath, 88);
+    const smoothedText =
+      snapshot.comparableDataPoints >= 2
+        ? `${smoothedBar} ${snapshot.smoothedEffectivePercent.toFixed(1)}%`
+        : chalk.dim('n/a (need >=2 comparable samples)');
+    const driftText =
+      snapshot.percentDrift === null
+        ? chalk.dim('n/a')
+        : snapshot.percentDrift >= 15
+        ? chalk.red(`${snapshot.percentDrift.toFixed(1)} pts`)
+        : snapshot.percentDrift >= 5
+        ? chalk.yellow(`${snapshot.percentDrift.toFixed(1)} pts`)
+        : chalk.green(`${snapshot.percentDrift.toFixed(1)} pts`);
     const trendText =
       snapshot.trendDeltaPercent === null
-        ? chalk.dim('n/a (need >=2 samples)')
+        ? snapshot.dataPoints > 1 && snapshot.comparableDataPoints < 2
+          ? chalk.dim('n/a (recent samples mix models or windows)')
+          : chalk.dim('n/a (need >=2 comparable samples)')
         : snapshot.trendDeltaPercent > 0
         ? chalk.red(`+${snapshot.trendDeltaPercent.toFixed(1)}% vs previous`)
         : snapshot.trendDeltaPercent < 0
@@ -1143,13 +1656,17 @@ export class CommandHandler {
       `Scope: ${target.scopeLabel}`,
       `Status: ${levelText} (${snapshot.levelReason})`,
       `Confidence: ${confidenceText} (${snapshot.confidenceReason})`,
-      `Samples: ${snapshot.dataPoints}`,
+      `Samples: ${snapshot.dataPoints} total / ${snapshot.comparableDataPoints} comparable`,
+      `Coverage: native ${snapshot.nativeSampleCount}, calculated ${snapshot.calculatedSampleCount}, explicit window ${snapshot.explicitWindowSampleCount}, estimated ${snapshot.estimatedWindowSampleCount}`,
+      `Mixing: models ${snapshot.mixedModels ? 'mixed' : 'stable'}, windows ${snapshot.mixedContextWindows ? 'mixed' : 'stable'}`,
       `Model: ${snapshot.model}`,
       `Source: ${snapshot.source === 'native' ? 'native context_window.used_percentage' : 'calculated from usage tokens'}`,
       `Observed at: ${snapshot.timestampLabel}`,
       `Raw usage:      ${rawBar} ${snapshot.rawPercent.toFixed(1)}%`,
+      `Usage est.:    ${usageEstimateBar} ${snapshot.usageDerivedPercent.toFixed(1)}%`,
+      `Source drift: ${driftText}`,
       `Buffered usage: ${effectiveBar} ${snapshot.effectivePercent.toFixed(1)}%`,
-      `Smoothed(3):    ${smoothedBar} ${snapshot.smoothedEffectivePercent.toFixed(1)}%`,
+      `Smoothed(3):    ${smoothedText}`,
       `Trend: ${trendText}`,
       `Tokens: ${this.formatTokenNumber(snapshot.usedTokens)} used / ${this.formatTokenNumber(snapshot.contextWindowTokens)} window`,
       `Buffer reserve: ${this.formatTokenNumber(snapshot.autocompactBufferTokens)} tokens (${Math.round(
@@ -1171,7 +1688,7 @@ export class CommandHandler {
       })
     );
 
-    const suggestions = this.getContextHealthSuggestions(snapshot.level, snapshot.confidence);
+    const suggestions = this.getContextHealthSuggestions(snapshot);
     if (suggestions.length > 0) {
       console.log('');
       console.log(chalk.bold('  Recommendations'));
@@ -1634,13 +2151,25 @@ export class CommandHandler {
     return path.resolve(inputPath).replace(/\//g, '\\').replace(/\\+/g, '\\').toLowerCase();
   }
 
-  private getContextHealthSuggestions(level: ContextHealthLevel, confidence: ContextHealthConfidence): string[] {
+  private getContextHealthSuggestions(snapshot: ContextHealthSnapshot): string[] {
     const suggestions: string[] = [];
-    if (confidence === 'low') {
+    if (snapshot.confidence === 'low') {
       suggestions.push(chalk.yellow('Data confidence is low, run /context_health current again after a fresh turn'));
     }
 
-    if (level === 'critical') {
+    if (snapshot.explicitWindowSampleCount === 0) {
+      suggestions.push(chalk.yellow('Recent samples do not include an explicit context window size, so percentages are directional only'));
+    }
+
+    if (snapshot.dataPoints > 1 && snapshot.comparableDataPoints < 2) {
+      suggestions.push(chalk.yellow('Recent samples mix models or context windows, so trend tracking is intentionally suppressed'));
+    }
+
+    if (snapshot.percentDrift !== null && snapshot.percentDrift >= 15) {
+      suggestions.push(chalk.yellow('Native context percentage and usage-token estimate diverge materially, so verify recorder schema before acting on the exact number'));
+    }
+
+    if (snapshot.level === 'critical') {
       suggestions.push(
         chalk.red('Compact or reset long chat history before the next heavy turn'),
         chalk.red('Trim project context payload and remove low-relevance docs'),
@@ -1649,7 +2178,7 @@ export class CommandHandler {
       return suggestions;
     }
 
-    if (level === 'elevated') {
+    if (snapshot.level === 'elevated') {
       suggestions.push(
         chalk.yellow('Monitor next few turns and watch for rapid token growth'),
         chalk.yellow('Prefer concise prompts and avoid redundant context blocks')
@@ -2312,7 +2841,23 @@ export class CommandHandler {
     return `${year}-${month}-${day}`;
   }
 
-  private renderTokenStructureSummary(target: TokenScanTarget, summary: TokenStructureSummary): void {
+  private async renderTokenStructureSummary(target: TokenScanTarget, summary: TokenStructureSummary): Promise<void> {
+    try {
+      await renderStaticInkScreen(
+        createElement(TokenStructureScreen, {
+          scopeLabel: target.scopeLabel,
+          sourceLabel: target.sourceLabel,
+          projectDirCount: target.projectDirs.length,
+          summary,
+        })
+      );
+      return;
+    } catch {
+      this.renderTokenStructureSummaryFallback(target, summary);
+    }
+  }
+
+  private renderTokenStructureSummaryFallback(target: TokenScanTarget, summary: TokenStructureSummary): void {
     const mostRecentMs = summary.files.reduce((max, file) => Math.max(max, file.latestTimestampMs), 0);
     const headerLines: string[] = [
       `Scope: ${target.scopeLabel}`,
@@ -2445,6 +2990,7 @@ export class CommandHandler {
     try {
       const requestedPath = args.join(' ').trim();
       const targetPath = requestedPath ? path.resolve(process.cwd(), requestedPath) : process.cwd();
+      const scopeLabel = requestedPath ? path.relative(process.cwd(), targetPath) || '.' : 'current_project';
       const targetStat = await fs.stat(targetPath);
       if (!targetStat.isDirectory()) {
         throw new Error(`Skills scan target is not a directory: ${targetPath}`);
@@ -2457,7 +3003,7 @@ export class CommandHandler {
         this.uiRenderer.renderSuccess('Skills scan completed');
       }
 
-      this.renderSkillsOverview(result);
+      await this.renderSkillsOverview(scopeLabel, result);
       this.recordCommandData(
         'skills',
         [
@@ -2485,7 +3031,151 @@ export class CommandHandler {
     }
   }
 
-  private renderSkillsOverview(result: SkillScanResult): void {
+  private async scanRules(args: string[]): Promise<void> {
+    const spinner = process.stdout.isTTY ? new Spinner() : null;
+    if (spinner) {
+      spinner.start('Scanning workspace rules...');
+    } else {
+      this.uiRenderer.renderInfo('Scanning workspace rules...');
+    }
+
+    try {
+      const requestedPath = args.join(' ').trim();
+      const targetPath = requestedPath ? path.resolve(process.cwd(), requestedPath) : process.cwd();
+      const scopeLabel = requestedPath ? path.relative(process.cwd(), targetPath) || '.' : 'current_project';
+      const targetStat = await fs.stat(targetPath);
+      if (!targetStat.isDirectory()) {
+        throw new Error(`Rules scan target is not a directory: ${targetPath}`);
+      }
+
+      const result = await this.ruleScanner.scan(targetPath);
+      if (spinner) {
+        spinner.stop('Rules scan completed');
+      } else {
+        this.uiRenderer.renderSuccess('Rules scan completed');
+      }
+
+      await this.renderRulesScanResult(scopeLabel, result);
+      this.recordCommandData(
+        'rules',
+        [
+          `root=${result.rootPath}`,
+          `scope=${scopeLabel}`,
+          `scannedFiles=${result.scannedFileCount}`,
+          `candidateFiles=${result.candidateFileCount}`,
+          `matchedFiles=${result.matchedFileCount}`,
+          `rules=${result.totalRules}`,
+          ...result.files.slice(0, 16).map((file) => {
+            const preview = file.rules
+              .slice(0, 6)
+              .map((rule) => `L${rule.lineStart}${rule.lineEnd > rule.lineStart ? `-${rule.lineEnd}` : ''}: ${rule.text}`)
+              .join(' | ');
+            return `${file.relativePath} [${file.labels.join(', ')}] => ${preview || '(no rules)'}`;
+          }),
+        ].join('\n')
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to scan rules';
+      if (spinner) {
+        spinner.fail(message);
+      } else {
+        this.uiRenderer.renderError(message);
+      }
+      this.recordCommandData('rules', `failed: ${message}`);
+    }
+  }
+
+  private async renderRulesScanResult(scopeLabel: string, result: RulesScanResult): Promise<void> {
+    try {
+      await renderStaticInkScreen(
+        createElement(RulesScanScreen, {
+          scopeLabel,
+          result,
+        })
+      );
+      return;
+    } catch {
+      this.renderRulesScanResultFallback(scopeLabel, result);
+    }
+  }
+
+  private renderRulesScanResultFallback(scopeLabel: string, result: RulesScanResult): void {
+    const summaryLines = [
+      `${chalk.gray('Scope')} ${chalk.white(scopeLabel)}`,
+      `${chalk.gray('Workspace')} ${chalk.white(result.rootPath)}`,
+      `${chalk.gray('Scanned files')} ${chalk.white(result.scannedFileCount)}    ${chalk.gray('Candidate files')} ${chalk.white(
+        result.candidateFileCount
+      )}`,
+      `${chalk.gray('Matched files')} ${chalk.cyan(result.matchedFileCount)}    ${chalk.gray('Extracted rules')} ${chalk.cyan(
+        result.totalRules
+      )}`,
+      chalk.dim('Rule detection is deterministic and line-based. Results are excerpts, not semantic summaries.'),
+    ];
+
+    console.log('');
+    console.log(
+      boxen(summaryLines.join('\n'), {
+        borderStyle: 'round',
+        borderColor: 'cyan',
+        title: ' Rules Scan ',
+        titleAlignment: 'left',
+        padding: { top: 0, right: 1, bottom: 0, left: 1 },
+      })
+    );
+
+    if (result.files.length === 0) {
+      console.log('');
+      console.log(chalk.yellow('  No explicit rule lines were detected in the target workspace.'));
+      console.log(chalk.dim('  Tip: place instructions in AGENTS.md, CLAUDE.md, .cursor/.claude, rules/, or system-prompt files.'));
+      return;
+    }
+
+    console.log('');
+    console.log(chalk.bold('  Detected Rules'));
+    result.files.forEach((file) => {
+      console.log('');
+      console.log(this.renderRulesFileHeader(file));
+      file.rules.forEach((rule) => {
+        console.log(this.renderRuleLine(rule));
+      });
+    });
+  }
+
+  private renderRulesFileHeader(file: RulesFile): string {
+    const labelText = file.labels.length > 0 ? ` [${file.labels.join(', ')}]` : '';
+    return (
+      chalk.dim('  - ') +
+      chalk.cyan(file.relativePath) +
+      chalk.dim(labelText) +
+      chalk.dim(`  (${file.rules.length} rule${file.rules.length === 1 ? '' : 's'})`)
+    );
+  }
+
+  private renderRuleLine(rule: ExtractedRule): string {
+    const lineLabel =
+      rule.lineStart === rule.lineEnd ? `L${rule.lineStart}` : `L${rule.lineStart}-${rule.lineEnd}`;
+    const signalLabel =
+      rule.signal === 'explicit' ? chalk.green('explicit') : chalk.yellow('section');
+    const headingText =
+      rule.headingPath.length > 0 ? chalk.dim(`  (${rule.headingPath.join(' > ')})`) : '';
+    return `      ${chalk.dim(lineLabel.padEnd(8, ' '))}${signalLabel} ${chalk.white(rule.text)}${headingText}`;
+  }
+
+  private async renderSkillsOverview(scopeLabel: string, result: SkillScanResult): Promise<void> {
+    try {
+      await renderStaticInkScreen(
+        createElement(SkillsOverviewScreen, {
+          scopeLabel,
+          result,
+        })
+      );
+      return;
+    } catch {
+      this.renderSkillsOverviewFallback(result);
+    }
+  }
+
+  private renderSkillsOverviewFallback(result: SkillScanResult): void {
     const totalInstructionTokens = result.skills.reduce((sum, skill) => sum + skill.instructionTokenEstimate, 0);
     const skillFolders = new Set(result.skills.map((skill) => skill.relativeDir)).size;
     const resourceCoverage = this.buildSkillCoverageSummary(result.skills);
@@ -2724,18 +3414,17 @@ export class CommandHandler {
           : mode === 'messages_usage'
             ? 'messages usage.input_tokens'
             : 'local estimated tokens';
-      this.uiRenderer.renderInfo(`Tokenizer mode: ${modeLabel}`);
-      if (warning) {
-        this.uiRenderer.renderWarning(warning);
-      }
-
-      console.log('');
-      console.log(chalk.bold('  Prompt Asset Scan'));
-      console.log(chalk.dim('  - ') + chalk.gray('Project: ') + chalk.white(result.rootPath));
-      console.log(chalk.dim('  - ') + chalk.gray('Scanned files: ') + chalk.white(result.scannedFileCount));
-      console.log(chalk.dim('  - ') + chalk.gray('Prompt assets: ') + chalk.white(result.files.length));
 
       if (result.files.length === 0) {
+        console.log('');
+        console.log(chalk.bold('  Prompt Asset Scan'));
+        console.log(chalk.dim('  - ') + chalk.gray('Project: ') + chalk.white(result.rootPath));
+        console.log(chalk.dim('  - ') + chalk.gray('Scanned files: ') + chalk.white(result.scannedFileCount));
+        console.log(chalk.dim('  - ') + chalk.gray('Prompt assets: ') + chalk.white(result.files.length));
+        this.uiRenderer.renderInfo(`Tokenizer mode: ${modeLabel}`);
+        if (warning) {
+          this.uiRenderer.renderWarning(warning);
+        }
         this.uiRenderer.renderWarning('No prompt assets found in current directory');
         this.renderContextAnatomyView(anatomyView);
         this.recordCommandData(
@@ -2751,35 +3440,12 @@ export class CommandHandler {
         );
         return;
       }
-
-      const categoryOrder: PromptAssetCategory[] = ['project-config', 'prompt-file', 'rules', 'system-prompt', 'docs'];
-      const categoryNames: Record<PromptAssetCategory, string> = {
-        'project-config': 'Project Config',
-        'prompt-file': '.prompt Files',
-        rules: 'rules/ Files',
-        'system-prompt': 'System Prompt',
-        docs: 'docs/ Files',
-      };
-
-      console.log('');
-      console.log(chalk.bold('  Categories'));
-      categoryOrder.forEach((category) => {
-        const count = result.files.filter((file) => file.categories.includes(category)).length;
-        if (count > 0) {
-          console.log(chalk.dim('  - ') + chalk.gray(categoryNames[category] + ': ') + chalk.white(count));
-        }
+      await this.renderPromptScanResult({
+        modeLabel,
+        warning,
+        result,
+        anatomyView,
       });
-
-      console.log('');
-      console.log(chalk.bold('  Files'));
-      result.files.forEach((file) => {
-        const tag = file.categories.map((category) => categoryNames[category]).join(', ');
-        const tokenInfo = file.tokenCount > 0 ? `${file.tokenCount.toString().padStart(5)} tok` : '  n/a tok';
-        console.log(chalk.dim('  - ') + chalk.cyan(file.relativePath) + chalk.dim(`  ${tokenInfo}  [${tag}]`));
-      });
-      console.log('');
-
-      this.renderContextAnatomyView(anatomyView);
       const topFiles = result.files
         .slice()
         .sort((a, b) => b.tokenCount - a.tokenCount || a.relativePath.localeCompare(b.relativePath))
@@ -2808,6 +3474,70 @@ export class CommandHandler {
       }
       this.recordCommandData('scan_prompt', `failed: ${message}`);
     }
+  }
+
+  private async renderPromptScanResult(presentation: PromptScanPresentation): Promise<void> {
+    try {
+      await renderStaticInkScreen(
+        createElement(ScanPromptScreen, {
+          scopeLabel: 'current_project',
+          rootPath: presentation.result.rootPath,
+          tokenizerModeLabel: presentation.modeLabel,
+          tokenizerWarning: presentation.warning,
+          scannedFileCount: presentation.result.scannedFileCount,
+          files: presentation.result.files,
+          anatomyLines: presentation.anatomyView.lines,
+          anatomySummary: presentation.anatomyView.summary,
+          recommendations: presentation.anatomyView.recommendations,
+        })
+      );
+      return;
+    } catch {
+      this.renderPromptScanResultFallback(presentation);
+    }
+  }
+
+  private renderPromptScanResultFallback(presentation: PromptScanPresentation): void {
+    const { modeLabel, warning, result, anatomyView } = presentation;
+    const categoryOrder: PromptAssetCategory[] = ['project-config', 'prompt-file', 'rules', 'system-prompt', 'docs'];
+    const categoryNames: Record<PromptAssetCategory, string> = {
+      'project-config': 'Project Config',
+      'prompt-file': '.prompt Files',
+      rules: 'rules/ Files',
+      'system-prompt': 'System Prompt',
+      docs: 'docs/ Files',
+    };
+
+    this.uiRenderer.renderInfo(`Tokenizer mode: ${modeLabel}`);
+    if (warning) {
+      this.uiRenderer.renderWarning(warning);
+    }
+
+    console.log('');
+    console.log(chalk.bold('  Prompt Asset Scan'));
+    console.log(chalk.dim('  - ') + chalk.gray('Project: ') + chalk.white(result.rootPath));
+    console.log(chalk.dim('  - ') + chalk.gray('Scanned files: ') + chalk.white(result.scannedFileCount));
+    console.log(chalk.dim('  - ') + chalk.gray('Prompt assets: ') + chalk.white(result.files.length));
+
+    console.log('');
+    console.log(chalk.bold('  Categories'));
+    categoryOrder.forEach((category) => {
+      const count = result.files.filter((file) => file.categories.includes(category)).length;
+      if (count > 0) {
+        console.log(chalk.dim('  - ') + chalk.gray(categoryNames[category] + ': ') + chalk.white(count));
+      }
+    });
+
+    console.log('');
+    console.log(chalk.bold('  Files'));
+    result.files.forEach((file) => {
+      const tag = file.categories.map((category) => categoryNames[category]).join(', ');
+      const tokenInfo = file.tokenCount > 0 ? `${file.tokenCount.toString().padStart(5)} tok` : '  n/a tok';
+      console.log(chalk.dim('  - ') + chalk.cyan(file.relativePath) + chalk.dim(`  ${tokenInfo}  [${tag}]`));
+    });
+    console.log('');
+
+    this.renderContextAnatomyView(anatomyView);
   }
 
   private async withTimeout<T>(task: () => Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -3582,35 +4312,142 @@ export class CommandHandler {
 
   private async resolveClaudeProjectDirectories(projectsRoot: string, rootPath: string): Promise<string[]> {
     const normalizedRoot = path.resolve(rootPath);
-    const encodedExact = this.encodeClaudeProjectPath(normalizedRoot);
-    const exactDir = path.join(projectsRoot, encodedExact);
-    if (await this.pathExists(exactDir)) {
-      return [exactDir];
+    const projectEntries = await this.listClaudeProjectDirEntries(projectsRoot);
+    if (projectEntries.length === 0) {
+      return [];
+    }
+
+    const exactMatches = this.findClaudeProjectExactMatches(projectsRoot, projectEntries, normalizedRoot);
+    if (exactMatches.length > 0) {
+      return exactMatches;
     }
 
     const fallback: string[] = [];
-    const baseName = path.basename(normalizedRoot).toLowerCase();
-    if (!baseName) {
-      return fallback;
-    }
+    const seen = new Set<string>();
+    for (const candidateRoot of this.buildPathAncestors(normalizedRoot)) {
+      const baseName = path.basename(candidateRoot).toLowerCase();
+      if (!baseName) {
+        continue;
+      }
 
-    try {
-      const dirs = await fs.readdir(projectsRoot, { withFileTypes: true });
-      for (const entry of dirs) {
-        if (!entry.isDirectory()) {
+      for (const entry of projectEntries) {
+        const name = entry.name.toLowerCase();
+        if (!name.endsWith(`-${baseName}`)) {
           continue;
         }
-
-        const name = entry.name.toLowerCase();
-        if (name.endsWith(`-${baseName}`)) {
-          fallback.push(path.join(projectsRoot, entry.name));
+        const fullPath = path.join(projectsRoot, entry.name);
+        if (seen.has(fullPath)) {
+          continue;
         }
+        seen.add(fullPath);
+        fallback.push(fullPath);
       }
-    } catch {
+    }
+
+    if (fallback.length > 0) {
+      return fallback.slice(0, 3);
+    }
+
+    const scored = projectEntries
+      .map((entry) => ({
+        fullPath: path.join(projectsRoot, entry.name),
+        score: this.scoreClaudeProjectDirMatch(entry.name, normalizedRoot),
+      }))
+      .filter((candidate) => candidate.score > 0)
+      .sort((a, b) => b.score - a.score || a.fullPath.localeCompare(b.fullPath));
+
+    if (scored.length === 0) {
       return fallback;
     }
 
-    return fallback.slice(0, 3);
+    return scored.slice(0, 3).map((candidate) => candidate.fullPath);
+  }
+
+  private async listClaudeProjectDirEntries(projectsRoot: string): Promise<Array<{ name: string }>> {
+    try {
+      const entries = await fs.readdir(projectsRoot, { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => ({ name: entry.name }));
+    } catch {
+      return [];
+    }
+  }
+
+  private findClaudeProjectExactMatches(
+    projectsRoot: string,
+    projectEntries: Array<{ name: string }>,
+    rootPath: string
+  ): string[] {
+    const ancestors = this.buildPathAncestors(rootPath);
+    const entryMap = new Map(projectEntries.map((entry) => [entry.name.toLowerCase(), entry.name]));
+
+    for (const candidateRoot of ancestors) {
+      for (const candidateName of this.buildClaudeProjectPathCandidates(candidateRoot)) {
+        const matched = entryMap.get(candidateName.toLowerCase());
+        if (matched) {
+          return [path.join(projectsRoot, matched)];
+        }
+      }
+    }
+
+    return [];
+  }
+
+  private buildPathAncestors(inputPath: string): string[] {
+    const ancestors: string[] = [];
+    let current = path.resolve(inputPath);
+    while (true) {
+      ancestors.push(current);
+      const parent = path.dirname(current);
+      if (parent === current) {
+        break;
+      }
+      current = parent;
+    }
+    return ancestors;
+  }
+
+  private buildClaudeProjectPathCandidates(inputPath: string): string[] {
+    const resolved = path.resolve(inputPath);
+    const percentEncoded = this.encodeClaudeProjectPath(resolved);
+    const legacyDashed = resolved.replace(/[\\/:]/g, '-');
+    return Array.from(new Set([percentEncoded, legacyDashed]));
+  }
+
+  private scoreClaudeProjectDirMatch(entryName: string, rootPath: string): number {
+    const normalizedEntry = entryName.toLowerCase();
+    let bestScore = 0;
+
+    for (const candidateRoot of this.buildPathAncestors(rootPath)) {
+      const legacyDashed = candidateRoot.replace(/[\\/:]/g, '-').toLowerCase();
+      const baseName = path.basename(candidateRoot).toLowerCase();
+      let score = 0;
+
+      if (legacyDashed && normalizedEntry === legacyDashed) {
+        score += 100;
+      } else if (legacyDashed && normalizedEntry.endsWith(legacyDashed)) {
+        score += 60;
+      }
+
+      if (baseName && normalizedEntry.endsWith(`-${baseName}`)) {
+        score += 15;
+      }
+
+      const rootParts = candidateRoot
+        .toLowerCase()
+        .split(/[\\/]+/)
+        .filter(Boolean)
+        .slice(-3);
+      const tailHits = rootParts.filter((part) => normalizedEntry.includes(part)).length;
+      score += tailHits * 5;
+
+      if (score > bestScore) {
+        bestScore = score;
+      }
+    }
+
+    return bestScore;
   }
 
   private async listRecentJsonlFiles(
@@ -3849,6 +4686,115 @@ export class CommandHandler {
       return relativePath;
     }
     return `...${relativePath.slice(-25)}`;
+  }
+
+  private formatStateLine(
+    label: string,
+    value: string,
+    tone: 'accent' | 'success' | 'warning' | 'danger' | 'muted' | 'default' = 'default',
+    note?: string
+  ): string {
+    const labelText = chalk.gray(`${label.padEnd(13)} `);
+    const valueText = this.colorizeStateValue(value, tone);
+    return note ? `${labelText}${valueText} ${chalk.dim(`(${note})`)}` : `${labelText}${valueText}`;
+  }
+
+  private colorizeStateValue(
+    value: string,
+    tone: 'accent' | 'success' | 'warning' | 'danger' | 'muted' | 'default'
+  ): string {
+    switch (tone) {
+      case 'accent':
+        return chalk.cyan(value);
+      case 'success':
+        return chalk.green(value);
+      case 'warning':
+        return chalk.yellow(value);
+      case 'danger':
+        return chalk.red(value);
+      case 'muted':
+        return chalk.gray(value);
+      default:
+        return chalk.white(value);
+    }
+  }
+
+  private formatPathForState(value: string, maxLength = 72): string {
+    const home = os.homedir().replace(/\\/g, '/');
+    const normalized = value.replace(/\\/g, '/');
+    const display = normalized.startsWith(home) ? `~${normalized.slice(home.length)}` : normalized;
+    if (display.length <= maxLength) {
+      return display;
+    }
+
+    const headLength = Math.max(12, Math.floor((maxLength - 3) / 2));
+    const tailLength = Math.max(12, maxLength - headLength - 3);
+    return `${display.slice(0, headLength)}...${display.slice(-tailLength)}`;
+  }
+
+  private summarizeProviderConfigSource(sources: ProviderConfigSources): string {
+    const runtimeSources = Array.from(
+      new Set(
+        [sources.apiKey, sources.baseUrl, sources.model].filter(
+          (item): item is 'session' | 'env' | 'local' => item === 'session' || item === 'env' || item === 'local'
+        )
+      )
+    );
+
+    if (runtimeSources.length === 0) {
+      return 'not configured';
+    }
+
+    if (runtimeSources.length === 1) {
+      return this.describeRuntimeSource(runtimeSources[0]);
+    }
+
+    return `mixed (${runtimeSources.map((item) => this.describeRuntimeSource(item)).join(' + ')})`;
+  }
+
+  private describeRuntimeSource(source: 'session' | 'env' | 'local'): string {
+    if (source === 'session') {
+      return 'session override';
+    }
+
+    if (source === 'env') {
+      return 'environment';
+    }
+
+    return 'local config file';
+  }
+
+  private describeConfigValueSource(source: ConfigValueSource): string {
+    switch (source) {
+      case 'session':
+        return 'session override';
+      case 'env':
+        return 'environment';
+      case 'local':
+        return 'local config file';
+      case 'default':
+        return 'provider default';
+      default:
+        return 'not set';
+    }
+  }
+
+  private getSessionOverrideLabels(sources: ProviderConfigSources): string[] {
+    const labels: string[] = [];
+
+    if (sources.apiKey === 'session') {
+      labels.push('API Key');
+    }
+
+    if (sources.baseUrl === 'session') {
+      labels.push('Base URL');
+    }
+
+    if (sources.model === 'session') {
+      labels.push('Model');
+    }
+
+    return labels;
   }
 
   private recordCommandData(command: string, data: string): void {

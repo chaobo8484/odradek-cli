@@ -1,26 +1,35 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 const DEFAULT_ENV_FILES = ['.env', '.env.local'];
+const APP_NAME = 'odradek-cli';
 const loadedEnvFiles = new Set<string>();
 
 export function loadEnvironmentFiles(cwd: string = process.cwd()): string[] {
-  for (const fileName of DEFAULT_ENV_FILES) {
-    const filePath = path.join(cwd, fileName);
-    if (!fs.existsSync(filePath)) {
-      continue;
-    }
+  const protectedKeys = new Set(Object.keys(process.env));
+  const keysLoadedByFiles = new Set<string>();
 
-    const raw = fs.readFileSync(filePath, 'utf8');
-    const entries = parseEnvFile(raw);
-
-    for (const [key, value] of entries) {
-      if (process.env[key] === undefined) {
-        process.env[key] = value;
+  for (const dirPath of collectEnvSearchDirs(cwd)) {
+    for (const fileName of DEFAULT_ENV_FILES) {
+      const filePath = path.join(dirPath, fileName);
+      if (!fs.existsSync(filePath)) {
+        continue;
       }
-    }
 
-    loadedEnvFiles.add(filePath);
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const entries = parseEnvFile(raw);
+
+      for (const [key, value] of entries) {
+        if (protectedKeys.has(key) && !keysLoadedByFiles.has(key)) {
+          continue;
+        }
+        process.env[key] = value;
+        keysLoadedByFiles.add(key);
+      }
+
+      loadedEnvFiles.add(filePath);
+    }
   }
 
   return Array.from(loadedEnvFiles);
@@ -28,6 +37,54 @@ export function loadEnvironmentFiles(cwd: string = process.cwd()): string[] {
 
 export function getLoadedEnvironmentFiles(): string[] {
   return Array.from(loadedEnvFiles);
+}
+
+function collectEnvSearchDirs(cwd: string): string[] {
+  const dirs: string[] = [];
+  const seen = new Set<string>();
+  const addDir = (dirPath: string) => {
+    const resolved = path.resolve(dirPath);
+    if (seen.has(resolved)) {
+      return;
+    }
+    seen.add(resolved);
+    dirs.push(resolved);
+  };
+
+  addDir(resolveAppConfigDir());
+
+  const cwdDirs: string[] = [];
+  let current = path.resolve(cwd);
+  while (true) {
+    cwdDirs.push(current);
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+
+  cwdDirs.reverse().forEach(addDir);
+  return dirs;
+}
+
+function resolveAppConfigDir(): string {
+  const home = os.homedir();
+  const platform = process.platform;
+
+  if (platform === 'win32') {
+    const appData = process.env.APPDATA;
+    if (appData) {
+      return path.join(appData, APP_NAME);
+    }
+    return path.join(home, 'AppData', 'Roaming', APP_NAME);
+  }
+
+  if (platform === 'darwin') {
+    return path.join(home, 'Library', 'Application Support', APP_NAME);
+  }
+
+  return path.join(home, '.config', APP_NAME);
 }
 
 function parseEnvFile(raw: string): Map<string, string> {

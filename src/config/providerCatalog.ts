@@ -1,4 +1,4 @@
-export type ProviderName = 'claude' | 'openrouter';
+export type ProviderName = 'claude' | 'openrouter' | 'qwen';
 
 export type ProviderMeta = {
   displayName: string;
@@ -34,6 +34,17 @@ export const PROVIDER_CATALOG: Record<ProviderName, ProviderMeta> = {
     },
     apiKeyPlaceholder: 'sk-or-v1-...',
     modelPlaceholder: 'provider/model-name',
+  },
+  qwen: {
+    displayName: 'Qwen',
+    defaultBaseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    envKeys: {
+      apiKey: ['ODRADEK_QWEN_API_KEY', 'DASHSCOPE_API_KEY'],
+      baseUrl: ['ODRADEK_QWEN_BASE_URL'],
+      model: ['ODRADEK_QWEN_MODEL'],
+    },
+    apiKeyPlaceholder: 'sk-...',
+    modelPlaceholder: 'qwen3.5-plus',
   },
 };
 

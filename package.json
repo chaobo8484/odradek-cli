@@ -1,6 +1,6 @@
 {
   "name": "odradek-cli",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A CLI tool for analyzing, enhancing, and diagnosing Claude Code and agent workflows.",
   "main": "./dist/index.js",
   "bin": {
@@ -44,7 +44,8 @@
     "ink": "^6.8.0",
     "inquirer": "^9.2.15",
     "ora": "^8.0.1",
-    "react": "^19.2.4"
+    "react": "^19.2.4",
+    "typescript": "^5.3.3"
   },
   "devDependencies": {
     "@types/node": "^20.11.19",

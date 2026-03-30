@@ -2,6 +2,7 @@ import chalk from 'chalk';
 
 export class Spinner {
   private frames = ['-', '\\', '|', '/'];
+  private readonly frameColor = chalk.hex('#D6F54A');
   private currentFrame = 0;
   private interval: NodeJS.Timeout | null = null;
   private message = '';
@@ -48,7 +49,7 @@ export class Spinner {
     process.stdout.write(
       '\r' +
         chalk.dim('  | ') +
-        chalk.cyan(this.frames[this.currentFrame]) +
+        this.frameColor(this.frames[this.currentFrame]) +
         ' ' +
         chalk.gray(`${this.message} (${elapsed})`)
     );

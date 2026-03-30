@@ -1,4 +1,4 @@
-﻿export interface Command {
+export interface Command {
   name: string;
   description: string;
   aliases?: string[];
@@ -14,6 +14,7 @@ export class CommandRegistry {
 
   private registerDefaultCommands(): void {
     this.register({ name: 'help', description: 'Show help information', usage: '/help' });
+    this.register({ name: 'state', description: 'Show current project and runtime status', usage: '/state' });
     this.register({ name: 'clear', description: 'Clear conversation history', usage: '/clear' });
     this.register({ name: 'history', description: 'Show all conversation messages', usage: '/history' });
     this.register({ name: 'collapse', description: 'Collapse messages', usage: '/collapse [id|all]' });
@@ -23,13 +24,13 @@ export class CommandRegistry {
     this.register({ name: 'export', description: 'Export conversation history', usage: '/export [filename]' });
     this.register({
       name: 'model',
-      description: 'Switch the active API model for this CLI session',
+      description: 'Set the active API model for the current provider',
       usage: '/model [model-name|clear]',
     });
     this.register({
       name: 'provider',
       description: 'Switch the active LLM provider',
-      usage: '/provider [claude|openrouter]',
+      usage: '/provider [claude|openrouter|qwen]',
     });
     this.register({
       name: 'trustpath',
@@ -56,6 +57,12 @@ export class CommandRegistry {
       usage: '/scan_prompt',
     });
     this.register({
+      name: 'rules',
+      description: 'Detect explicit project rules and instruction lines in a workspace',
+      aliases: ['scan_rules', 'rulecheck'],
+      usage: '/rules [path]',
+    });
+    this.register({
       name: 'scan_tokens',
       description: 'Parse Claude JSONL token structures and render token analytics',
       aliases: ['scantokens', 'tokenscan'],
@@ -68,8 +75,14 @@ export class CommandRegistry {
       usage: '/context_health [current|all|path]',
     });
     this.register({
+      name: 'noise_eval',
+      description: 'Run evidence-first noise evaluation across outcome, process, context, and validation',
+      aliases: ['noise'],
+      usage: '/noise_eval [current|all|path]',
+    });
+    this.register({
       name: 'context_noise',
-      description: 'Detect noisy context from Claude JSONL sessions and suggest delete/keep',
+      description: 'Legacy alias for the formal noise evaluation command',
       aliases: ['ctxnoise', 'contextnoise'],
       usage: '/context_noise [current|all|path]',
     });

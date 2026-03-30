@@ -37,6 +37,7 @@ const DEFAULT_CONFIG: AppConfig = {
   providers: {
     claude: {},
     openrouter: {},
+    qwen: {},
   },
   trustedPaths: [],
   projectContextEnabled: true,
@@ -173,6 +174,51 @@ export class ConfigStore {
 
   getConfigPath(): string {
     return this.configPath;
+  }
+
+  async setStoredProviderConfig(provider: ProviderName, config: ProviderConfig): Promise<void> {
+    const current = await this.getStoredConfig();
+    const currentProvider = current.providers[provider] ?? {};
+    const nextProvider = this.normalizeProviderConfig({
+      ...currentProvider,
+      ...config,
+    });
+
+    await this.writeConfig({
+      ...current,
+      providers: {
+        ...current.providers,
+        [provider]: nextProvider,
+      },
+    });
+  }
+
+  async clearStoredProviderConfig(provider: ProviderName, keys?: Array<keyof ProviderConfig>): Promise<void> {
+    const current = await this.getStoredConfig();
+    const nextProvider: ProviderConfig = { ...(current.providers[provider] ?? {}) };
+
+    if (!keys || keys.length === 0) {
+      await this.writeConfig({
+        ...current,
+        providers: {
+          ...current.providers,
+          [provider]: {},
+        },
+      });
+      return;
+    }
+
+    for (const key of keys) {
+      delete nextProvider[key];
+    }
+
+    await this.writeConfig({
+      ...current,
+      providers: {
+        ...current.providers,
+        [provider]: this.normalizeProviderConfig(nextProvider),
+      },
+    });
   }
 
   setSessionProviderConfig(provider: ProviderName, config: ProviderConfig): void {

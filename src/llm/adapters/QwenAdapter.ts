@@ -3,7 +3,7 @@ import https from 'node:https';
 import { Message } from '../../cli/ConversationManager.js';
 import { AdapterDiscoveryConfig, AdapterRuntimeConfig, LLMAdapter } from './types.js';
 
-type OpenRouterResponse = {
+type QwenResponse = {
   choices?: Array<{
     message?: {
       content?:
@@ -12,6 +12,7 @@ type OpenRouterResponse = {
             type?: string;
             text?: string;
           }>;
+      reasoning_content?: string;
     };
   }>;
   error?: {
@@ -20,7 +21,7 @@ type OpenRouterResponse = {
   };
 };
 
-type OpenRouterMessageContent =
+type QwenMessageContent =
   | string
   | Array<{
       type?: string;
@@ -28,7 +29,7 @@ type OpenRouterMessageContent =
     }>
   | undefined;
 
-type OpenRouterModelsPayload = {
+type QwenModelsPayload = {
   data?: Array<{ id?: string }>;
 };
 
@@ -39,17 +40,17 @@ type HttpResponseLike = {
   json<T>(): Promise<T>;
 };
 
-export class OpenRouterAdapter implements LLMAdapter {
+export class QwenAdapter implements LLMAdapter {
   private static readonly DEFAULT_MAX_OUTPUT_TOKENS = 1024;
-  readonly provider = 'openrouter' as const;
-  readonly displayName = 'OpenRouter';
-  readonly defaultBaseUrl = 'https://openrouter.ai/api/v1';
+  readonly provider = 'qwen' as const;
+  readonly displayName = 'Qwen';
+  readonly defaultBaseUrl = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
 
   async generateReply(messages: Message[], config: AdapterRuntimeConfig): Promise<string> {
     const url = `${this.resolveBaseUrl(config.baseUrl)}/chat/completions`;
     const payload = {
       model: config.model.trim(),
-      max_tokens: OpenRouterAdapter.DEFAULT_MAX_OUTPUT_TOKENS,
+      max_tokens: QwenAdapter.DEFAULT_MAX_OUTPUT_TOKENS,
       messages: messages.map((message) => ({
         role: message.role,
         content: message.content,
@@ -59,15 +60,15 @@ export class OpenRouterAdapter implements LLMAdapter {
     const response = await this.postJson(url, payload, this.buildHeaders(config.apiKey));
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(this.formatOpenRouterError(response.status, errorText, config.model.trim()));
+      throw new Error(this.formatQwenError(response.status, errorText, config.model.trim()));
     }
 
-    const data = await response.json<OpenRouterResponse>();
+    const data = await response.json<QwenResponse>();
     const content = data.choices?.[0]?.message?.content;
     const text = this.extractTextContent(content);
 
     if (!text) {
-      throw new Error('OpenRouter returned an empty response.');
+      throw new Error('Qwen returned an empty response.');
     }
 
     return text;
@@ -80,19 +81,20 @@ export class OpenRouterAdapter implements LLMAdapter {
 
     if (!response.ok) {
       const preview = raw.slice(0, 300);
-      throw new Error(`Failed to fetch OpenRouter models (${response.status}) from ${url}: ${preview}`);
+      throw new Error(`Failed to fetch Qwen models (${response.status}) from ${url}: ${preview}`);
     }
 
-    const payload = raw ? (JSON.parse(raw) as OpenRouterModelsPayload) : {};
+    const payload = raw ? (JSON.parse(raw) as QwenModelsPayload) : {};
     const models = (payload.data ?? [])
       .map((item) => item.id?.trim())
       .filter((item): item is string => Boolean(item));
+    const filteredModels = this.filterPreferredModels(models);
 
-    if (models.length === 0) {
-      throw new Error('OpenRouter model list response did not contain any model IDs.');
+    if (filteredModels.length === 0) {
+      throw new Error('Qwen model list response did not contain any text/code model IDs.');
     }
 
-    return models;
+    return filteredModels;
   }
 
   private resolveBaseUrl(customBaseUrl?: string): string {
@@ -103,11 +105,10 @@ export class OpenRouterAdapter implements LLMAdapter {
     return {
       authorization: `Bearer ${apiKey}`,
       'content-type': 'application/json',
-      'x-title': 'Odradek CLI',
     };
   }
 
-  private extractTextContent(content: OpenRouterMessageContent): string {
+  private extractTextContent(content: QwenMessageContent): string {
     if (typeof content === 'string') {
       return content.trim();
     }
@@ -123,11 +124,11 @@ export class OpenRouterAdapter implements LLMAdapter {
     return '';
   }
 
-  private formatOpenRouterError(status: number, errorText: string, model: string): string {
+  private formatQwenError(status: number, errorText: string, model: string): string {
     const normalized = errorText.toLowerCase();
 
     if (status === 401 || status === 403) {
-      return `OpenRouter authentication failed (${status}). Please check your API key and permissions.`;
+      return `Qwen authentication failed (${status}). Please check your DashScope API key and permissions.`;
     }
 
     if (
@@ -137,27 +138,101 @@ export class OpenRouterAdapter implements LLMAdapter {
       normalized.includes('invalid model') ||
       (normalized.includes('model') && normalized.includes('not found'))
     ) {
-      return `Model unavailable: ${model}. Please verify the model name for OpenRouter. Raw error: ${errorText}`;
-    }
-
-    if (status === 402) {
-      return [
-        `OpenRouter credits are insufficient for this request (${status}).`,
-        `This usually happens when the provider defaults to a very large output limit; Odradek now sends max_tokens=${OpenRouterAdapter.DEFAULT_MAX_OUTPUT_TOKENS} for OpenRouter requests.`,
-        'If the error still appears, reduce request size further or add credits in OpenRouter.',
-        `Raw error: ${errorText}`,
-      ].join(' ');
+      return `Model unavailable: ${model}. Please verify the model name for Qwen. Raw error: ${errorText}`;
     }
 
     if (status === 429) {
-      return `OpenRouter rate limit exceeded (${status}). Please retry later. Raw error: ${errorText}`;
+      return `Qwen rate limit exceeded (${status}). Please retry later. Raw error: ${errorText}`;
     }
 
     if (status >= 500) {
-      return `OpenRouter service is temporarily unavailable (${status}). Please retry later. Raw error: ${errorText}`;
+      return `Qwen service is temporarily unavailable (${status}). Please retry later. Raw error: ${errorText}`;
     }
 
-    return `OpenRouter API request failed (${status}): ${errorText}`;
+    return `Qwen API request failed (${status}): ${errorText}`;
+  }
+
+  private filterPreferredModels(models: string[]): string[] {
+    const unique = Array.from(new Set(models.map((model) => model.trim()).filter(Boolean)));
+    return unique
+      .filter((model) => this.isTextOrCodeModel(model))
+      .sort((left, right) => {
+        const priorityDiff = this.getModelPriority(left) - this.getModelPriority(right);
+        if (priorityDiff !== 0) {
+          return priorityDiff;
+        }
+        return left.localeCompare(right);
+      });
+  }
+
+  private isTextOrCodeModel(model: string): boolean {
+    const normalized = model.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    const excludedSignals = [
+      'tts',
+      'image',
+      'audio',
+      'speech',
+      'voice',
+      'asr',
+      'transcribe',
+      'transcription',
+      'embedding',
+      'embed',
+      'rerank',
+      'video',
+      'vl',
+      'vision',
+      'omni',
+      'realtime',
+      'wanx',
+      'qvq',
+    ];
+
+    return !excludedSignals.some((signal) => normalized.includes(signal));
+  }
+
+  private getModelPriority(model: string): number {
+    const normalized = model.trim().toLowerCase();
+
+    if (normalized.includes('coder-next')) {
+      return 0;
+    }
+    if (normalized.includes('coder-plus')) {
+      return 1;
+    }
+    if (normalized.includes('coder-flash')) {
+      return 2;
+    }
+    if (normalized.includes('coder')) {
+      return 3;
+    }
+    if (normalized.startsWith('qwen3.5-plus')) {
+      return 10;
+    }
+    if (normalized.startsWith('qwen3-max') || normalized.startsWith('qwen-max')) {
+      return 20;
+    }
+    if (normalized.startsWith('qwen-plus')) {
+      return 30;
+    }
+    if (normalized.startsWith('qwen-long')) {
+      return 40;
+    }
+    if (normalized.startsWith('qwen3.5-flash') || normalized.startsWith('qwen-flash')) {
+      return 50;
+    }
+    if (normalized.startsWith('qwen-turbo')) {
+      return 60;
+    }
+    if (normalized.startsWith('qwq')) {
+      return 70;
+    }
+
+    return 100;
   }
 
   private async getJson(url: string, headers: Record<string, string>): Promise<HttpResponseLike> {
