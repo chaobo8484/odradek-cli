@@ -1,5 +1,6 @@
 ﻿import readline from 'readline';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import chalk from 'chalk';
 import { fileURLToPath } from 'url';
@@ -53,6 +54,8 @@ export class CLI {
   private pendingExitConfirmationUntil = 0;
   private pendingExitConfirmationTimer: ReturnType<typeof setTimeout> | null = null;
   private exitConfirmationNoticeVisible = false;
+  private activeDetailPageContext: { command: string; dialogueTurns: number } | null = null;
+  private isReturningFromDetailPage = false;
   private readonly onInputAssistKeypress = (str: string, key: readline.Key): void => {
     if (!(key.ctrl && key.name === 'c') && this.hasPendingExitConfirmation()) {
       this.clearPendingExitConfirmation(true);
@@ -63,7 +66,7 @@ export class CLI {
     }
 
     if (key.ctrl && key.name === 'c') {
-      this.handleSigint();
+      void this.handleSigint();
       return;
     }
 
@@ -214,6 +217,7 @@ export class CLI {
     this.inlineSuggestionLines = 0;
     this.lastInlineSuggestionQuery = '';
     this.promptVisibleLines = 0;
+    this.activeDetailPageContext = null;
 
     const windowWidth = this.getHomeWindowWidth();
     const panelContentWidth = Math.max(30, windowWidth - 4);
@@ -323,9 +327,7 @@ export class CLI {
   private getHomeQuickStartLines(width: number): string[] {
     return [
       this.formatHomeKeyValueLine('chat', 'Type anything below to start a conversation', width, 'muted'),
-      this.formatHomeKeyValueLine('commands', '/ opens the command palette', width, 'accent'),
-      this.formatHomeKeyValueLine('starter cmds', '/noise_eval  /model  /provider  /trustpath', width, 'accent'),
-      this.formatHomeKeyValueLine('help', 'Run /help to see all available commands', width, 'muted'),
+      this.formatHomeKeyValueLine('commands', '/ opens the command palette and type /help to see all commands', width, 'accent')
     ];
   }
 
@@ -338,6 +340,51 @@ export class CLI {
     const normalizedLabel = `${label.padEnd(13)} `;
     const valueWidth = Math.max(8, width - this.getDisplayWidth(normalizedLabel));
     return this.homeMuted(normalizedLabel) + this.colorizeHomeValue(this.truncatePlainText(value, valueWidth), tone);
+  }
+
+  private formatHomeParallelKeyValueLines(
+    left: {
+      label: string;
+      value: string;
+      tone: 'accent' | 'success' | 'warning' | 'danger' | 'muted' | 'default';
+    },
+    right: {
+      label: string;
+      value: string;
+      tone: 'accent' | 'success' | 'warning' | 'danger' | 'muted' | 'default';
+    },
+    width: number
+  ): string[] {
+    if (width < 56) {
+      return [
+        this.formatHomeKeyValueLine(left.label, left.value, width, left.tone),
+        this.formatHomeKeyValueLine(right.label, right.value, width, right.tone),
+      ];
+    }
+
+    const gap = 4;
+    const leftWidth = Math.max(18, Math.floor((width - gap) / 2));
+    const rightWidth = Math.max(18, width - gap - leftWidth);
+    const leftLine = this.formatHomeKeyValueLine(left.label, left.value, leftWidth, left.tone);
+    const rightLine = this.formatHomeKeyValueLine(right.label, right.value, rightWidth, right.tone);
+    return [`${this.padAnsiText(leftLine, leftWidth)}${' '.repeat(gap)}${this.padAnsiText(rightLine, rightWidth)}`];
+  }
+
+  private formatHomeWrappedKeyValueLines(
+    label: string,
+    value: string,
+    width: number,
+    tone: 'accent' | 'success' | 'warning' | 'danger' | 'muted' | 'default' = 'default'
+  ): string[] {
+    const normalizedLabel = `${label.padEnd(13)} `;
+    const continuationLabel = ' '.repeat(this.getDisplayWidth(normalizedLabel));
+    const valueWidth = Math.max(8, width - this.getDisplayWidth(normalizedLabel));
+    const wrappedValueLines = this.wrapPlainText(value, valueWidth);
+
+    return wrappedValueLines.map((line, index) => {
+      const displayLabel = index === 0 ? normalizedLabel : continuationLabel;
+      return this.homeMuted(displayLabel) + this.colorizeHomeValue(line, tone);
+    });
   }
 
   private readPackageVersion(): string {
@@ -431,13 +478,38 @@ export class CLI {
     return `${head}${ellipsis}${tail}`;
   }
 
-  private formatDisplayPathForHome(inputPath: string, maxWidth: number): string {
-    const userHome = process.env.USERPROFILE?.replace(/\\/g, '/');
-    let normalized = inputPath.replace(/\\/g, '/');
-    if (userHome && normalized.startsWith(userHome)) {
-      normalized = `~${normalized.slice(userHome.length)}`;
+  private wrapPlainText(value: string, maxWidth: number): string[] {
+    if (maxWidth <= 0) {
+      return [''];
     }
-    return this.truncateMiddleText(normalized, maxWidth);
+
+    if (!value) {
+      return [''];
+    }
+
+    const lines: string[] = [];
+    let currentLine = '';
+
+    for (const character of Array.from(value)) {
+      const candidate = currentLine + character;
+      if (currentLine && this.getDisplayWidth(candidate) > maxWidth) {
+        lines.push(currentLine);
+        currentLine = character;
+        continue;
+      }
+
+      currentLine = candidate;
+    }
+
+    if (currentLine || lines.length === 0) {
+      lines.push(currentLine);
+    }
+
+    return lines;
+  }
+
+  private formatDisplayPathForHome(inputPath: string): string {
+    return path.resolve(inputPath);
   }
 
   private padAnsiText(value: string, width: number): string {
@@ -470,14 +542,7 @@ export class CLI {
         lines.push(this.formatHomeKeyValueLine('provider', providerMeta.displayName, width, 'default'));
         lines.push(this.formatHomeKeyValueLine('source', sourceSummary, width, 'accent'));
         lines.push(this.formatHomeKeyValueLine('model', currentModel, width, 'accent'));
-        lines.push(
-          this.formatHomeKeyValueLine(
-            'path',
-            this.formatDisplayPathForHome(process.cwd(), Math.max(12, width - 14)),
-            width,
-            'muted'
-          )
-        );
+        lines.push(...this.formatHomeWrappedKeyValueLines('path', this.formatDisplayPathForHome(process.cwd()), width, 'muted'));
         lines.push(this.formatHomeKeyValueLine('endpoint', currentBaseUrl, width, 'muted'));
         lines.push(...this.getEnvironmentStatusLines(diagnostics, activeProvider, width));
         return lines;
@@ -485,14 +550,7 @@ export class CLI {
 
       lines.push(this.formatHomeKeyValueLine('status', 'needs setup', width, 'warning'));
       lines.push(this.formatHomeKeyValueLine('provider', providerMeta.displayName, width, 'default'));
-      lines.push(
-        this.formatHomeKeyValueLine(
-          'path',
-          this.formatDisplayPathForHome(process.cwd(), Math.max(12, width - 14)),
-          width,
-          'muted'
-        )
-      );
+      lines.push(...this.formatHomeWrappedKeyValueLines('path', this.formatDisplayPathForHome(process.cwd()), width, 'muted'));
       if (!apiKey) {
         lines.push(
           this.formatHomeKeyValueLine(
@@ -526,14 +584,41 @@ export class CLI {
 
   private async getHomeProjectContextStatusLines(width: number): Promise<string[]> {
     try {
-      const config = await this.configStore.getConfig();
-      const enabled = config.projectContextEnabled;
+      const claudeCodeActive = this.hasUserWorkspaceToolingDirectory('.claude');
+      const codexActive = this.hasUserWorkspaceToolingDirectory('.codex');
       return [
-        this.formatHomeKeyValueLine('project ctx', enabled ? 'enabled' : 'disabled', width, enabled ? 'success' : 'warning'),
-        this.formatHomeKeyValueLine('toggle', '/projectcontext [on|off]', width, 'accent'),
+        ...this.formatHomeParallelKeyValueLines(
+          {
+            label: 'Claude Code',
+            value: claudeCodeActive ? 'active' : 'not active',
+            tone: claudeCodeActive ? 'success' : 'muted',
+          },
+          {
+            label: 'OpenAI Codex',
+            value: codexActive ? 'active' : 'not active',
+            tone: codexActive ? 'success' : 'muted',
+          },
+          width
+        ),
       ];
     } catch {
-      return [this.formatHomeKeyValueLine('project ctx', 'failed to read config', width, 'danger')];
+      const claudeCodeActive = this.hasUserWorkspaceToolingDirectory('.claude');
+      const codexActive = this.hasUserWorkspaceToolingDirectory('.codex');
+      return [
+        ...this.formatHomeParallelKeyValueLines(
+          {
+            label: 'Claude Code',
+            value: claudeCodeActive ? 'active' : 'not active',
+            tone: claudeCodeActive ? 'success' : 'muted',
+          },
+          {
+            label: 'OpenAI Codex',
+            value: codexActive ? 'active' : 'not active',
+            tone: codexActive ? 'success' : 'muted',
+          },
+          width
+        ),
+      ];
     }
   }
 
@@ -603,6 +688,14 @@ export class CLI {
       ];
     } catch {
       return [this.formatHomeKeyValueLine('trust', 'failed', width, 'danger')];
+    }
+  }
+
+  private hasUserWorkspaceToolingDirectory(directoryName: '.claude' | '.codex'): boolean {
+    try {
+      return fs.existsSync(path.join(os.homedir(), directoryName));
+    } catch {
+      return false;
     }
   }
 
@@ -830,6 +923,10 @@ export class CLI {
       return `  ${this.truncateAnsiLine(chalk.yellow('Press Ctrl+C again within 3 seconds to exit.'), columns - 2)}`;
     }
 
+    if (this.activeDetailPageContext) {
+      return `  ${this.truncateAnsiLine(chalk.dim(`Ctrl+C back to home · ${this.formatDetailPageHistoryLabel(this.activeDetailPageContext)}`), columns - 2)}`;
+    }
+
     if (this.getCurrentReadlineInput().trimStart().startsWith('/')) {
       return `  ${this.truncateAnsiLine(chalk.dim('Tab complete, ↑↓ choose command, Enter run'), columns - 2)}`;
     }
@@ -1047,14 +1144,25 @@ export class CLI {
 
     if (input.startsWith('/')) {
       const normalizedCommand = input.slice(1).trim().split(/\s+/)[0]?.toLowerCase() || 'unknown';
+      const canonicalCommand = this.commandRegistry.getCommand(normalizedCommand)?.name ?? normalizedCommand;
       const safeInput = this.maskSensitiveCommandInput(input);
       this.recordCommandData(normalizedCommand, `invoked ${safeInput}`);
       this.uiRenderer.renderCommandInvocation(safeInput);
       await this.commandHandler.handleCommand(input);
+      if (this.isDetailPageCommand(canonicalCommand)) {
+        this.activeDetailPageContext = { command: safeInput, dialogueTurns: 0 };
+      }
       if (normalizedCommand === 'clear') {
         this.commandDataHistory = [];
       }
       return;
+    }
+
+    if (this.activeDetailPageContext) {
+      this.activeDetailPageContext = {
+        ...this.activeDetailPageContext,
+        dialogueTurns: this.activeDetailPageContext.dialogueTurns + 1,
+      };
     }
 
     this.conversationManager.addMessage('user', input);
@@ -1589,7 +1697,12 @@ export class CLI {
     return error instanceof Error && error.name === 'ExitPromptError';
   }
 
-  private handleSigint(): void {
+  private async handleSigint(): Promise<void> {
+    if (this.activeDetailPageContext && !this.isLineProcessing && !this.isInteractiveCommandActive) {
+      await this.returnToWelcomeFromDetailPage();
+      return;
+    }
+
     if (this.hasPendingExitConfirmation()) {
       this.clearPendingExitConfirmation(true);
       this.exitWithFarewell();
@@ -1611,6 +1724,48 @@ export class CLI {
     if (!this.isInteractiveCommandActive && !this.isLineProcessing) {
       this.renderPromptArea();
     }
+  }
+
+  private isDetailPageCommand(commandName: string): boolean {
+    return new Set([
+      'state',
+      'skills',
+      'scan_prompt',
+      'rules',
+      'scan_tokens',
+      'context_health',
+      'noise_eval',
+      'context_noise',
+      'todo_granularity',
+    ]).has(commandName);
+  }
+
+  private async returnToWelcomeFromDetailPage(): Promise<void> {
+    if (this.isReturningFromDetailPage) {
+      return;
+    }
+
+    this.isReturningFromDetailPage = true;
+    const detailContext = this.activeDetailPageContext;
+    this.clearPendingExitConfirmation(true);
+    this.clearSuggestions();
+    this.setReadlineInput('');
+    this.clearPromptEchoBlock();
+
+    try {
+      await this.showWelcome();
+      if (detailContext) {
+        this.uiRenderer.renderCommandInvocation(detailContext.command);
+        this.uiRenderer.renderCommandResult(`History: ${this.formatDetailPageHistoryLabel(detailContext)}`);
+      }
+      this.showPrompt();
+    } finally {
+      this.isReturningFromDetailPage = false;
+    }
+  }
+
+  private formatDetailPageHistoryLabel(context: { command: string; dialogueTurns: number }): string {
+    return `${context.command} · ${context.dialogueTurns} dialogues`;
   }
 
   private hasPendingExitConfirmation(): boolean {

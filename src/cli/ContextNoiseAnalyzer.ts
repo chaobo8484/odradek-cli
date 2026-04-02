@@ -1,5 +1,11 @@
-import { promises as fs } from 'fs';
 import path from 'path';
+import {
+  parseClaudeTranscriptSession,
+  type TranscriptSource,
+  type ClaudeTranscriptContextItem as ContextItem,
+  type ClaudeTranscriptSession as ParsedSession,
+  type ClaudeTranscriptObservation as ToolObservation,
+} from './ClaudeTranscriptParser.js';
 import { estimateTokenCount } from './tokenEstimate.js';
 
 // ---------------------------------------------------------------------------
@@ -21,6 +27,7 @@ import { estimateTokenCount } from './tokenEstimate.js';
 export type ContextNoiseTarget = {
   sessionId: string;
   filePath: string;
+  source?: TranscriptSource;
 };
 
 export type ContextNoiseSeverity = 'high' | 'medium' | 'low';
@@ -113,70 +120,6 @@ export type ContextNoiseAnalysis = {
   warnings: string[];
 };
 
-// ---------------------------------------------------------------------------
-// Internal types
-// ---------------------------------------------------------------------------
-
-type NormalizedMessage = {
-  order: number;
-  timestampMs: number;
-  role: 'user' | 'assistant' | 'system' | 'unknown';
-  text: string;
-};
-
-type ToolObservation = {
-  id: string;
-  sessionId: string;
-  filePath: string;
-  order: number;
-  timestampMs: number;
-  name: string;
-  input: Record<string, unknown>;
-  inputText: string;
-  resultContent: string;
-  resultTokens: number;
-  estimatedTokens: number;
-  isError: boolean;
-  cwd: string;
-  targetPath: string;
-  command: string;
-  writePayload: string;
-};
-
-type ContextItem = {
-  order: number;
-  tokenCount: number;
-};
-
-type ParsedSession = {
-  sessionId: string;
-  filePath: string;
-  startTimestampMs: number;
-  endTimestampMs: number;
-  messages: NormalizedMessage[];
-  observations: ToolObservation[];
-  items: ContextItem[];
-};
-
-type PartialObservation = {
-  id: string;
-  sessionId: string;
-  filePath: string;
-  order: number;
-  timestampMs: number;
-  name: string;
-  input: Record<string, unknown>;
-  inputText: string;
-  resultContent?: string;
-  resultTokens?: number;
-  estimatedTokens?: number;
-  isError?: boolean;
-  cwd: string;
-  targetPath: string;
-  command: string;
-  writePayload: string;
-};
-
 type CategoryMeta = {
   tool: ContextNoiseCategory['tool'];
   label: string;
@@ -186,6 +129,8 @@ type CategoryMeta = {
 // Evidence record used internally during scoring
 type UsageEvidence = {
   pathMutation: boolean;       // a later write/edit targeted the same path
+  resultPathFollowup: boolean; // later reads/edits directly used a file returned by the tool
+  sameDirectoryFollowup: boolean; // later work narrowed into the same directory subtree
   pathMentioned: boolean;      // the path string appears in later tool inputs
   filenameMentioned: boolean;  // just the basename appears in later messages
   strongKeywordHit: boolean;   // a rare, specific keyword from the content appears later
@@ -214,8 +159,6 @@ const BROAD_SCAN_ENTRY_THRESHOLD = 50;
 
 // Confidence thresholds
 const MIN_CONFIDENCE = 0.55;   // events below this are discarded
-const DUP_MIN_CONFIDENCE = 0.70;  // duplicates need higher bar
-
 const CATEGORY_ORDER: ContextNoiseCategoryKey[] = [
   'read_dup',
   'bash_dup',
@@ -269,7 +212,7 @@ export class ContextNoiseAnalyzer {
     const primarySession = sessionSummaries[0] ?? null;
 
     if (sessions.length === 0) {
-      warnings.push('No analyzable Claude session JSONL files were found.');
+      warnings.push('No analyzable session JSONL files were found.');
     }
 
     return {
@@ -296,9 +239,10 @@ export class ContextNoiseAnalyzer {
               tokenCount: Math.max(observation.resultTokens, observation.estimatedTokens),
               order: observation.order,
               resultContent: observation.resultContent,
-              wasReferencedLater: this.scoreUsageEvidence(session, observation).pathMutation ||
-                this.scoreUsageEvidence(session, observation).pathMentioned ||
-                this.scoreUsageEvidence(session, observation).strongKeywordHit,
+              wasReferencedLater: (() => {
+                const usage = this.scoreUsageEvidence(session, observation);
+                return usage.pathMutation || usage.resultPathFollowup || usage.pathMentioned || usage.strongKeywordHit;
+              })(),
             }))
         )
         .sort((a, b) => b.tokenCount - a.tokenCount || a.path.localeCompare(b.path)),
@@ -307,143 +251,7 @@ export class ContextNoiseAnalyzer {
   }
 
   private async parseSession(target: ContextNoiseTarget): Promise<ParsedSession | null> {
-    let raw = '';
-    try {
-      raw = await fs.readFile(target.filePath, 'utf8');
-    } catch {
-      return null;
-    }
-
-    const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
-    const messages: NormalizedMessage[] = [];
-    const observations = new Map<string, PartialObservation>();
-    const items: ContextItem[] = [];
-    let startTimestampMs = 0;
-    let endTimestampMs = 0;
-
-    for (let index = 0; index < lines.length; index += 1) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(lines[index]) as unknown;
-      } catch {
-        continue;
-      }
-
-      const envelope = this.extractEnvelope(parsed);
-      if (!envelope) {
-        continue;
-      }
-
-      const timestampMs = envelope.timestampMs || this.parseTimestamp(this.getValueAtPath(parsed, ['timestamp'])) || 0;
-      if (timestampMs > 0) {
-        startTimestampMs = startTimestampMs === 0 ? timestampMs : Math.min(startTimestampMs, timestampMs);
-        endTimestampMs = Math.max(endTimestampMs, timestampMs);
-      }
-
-      if (envelope.text) {
-        messages.push({
-          order: index,
-          timestampMs,
-          role: envelope.role,
-          text: envelope.text,
-        });
-        items.push({
-          order: index,
-          tokenCount: estimateTokenCount(envelope.text),
-        });
-      }
-
-      for (const toolUse of envelope.toolUses) {
-        const partial: PartialObservation = {
-          id: toolUse.id,
-          sessionId: target.sessionId,
-          filePath: target.filePath,
-          order: index,
-          timestampMs,
-          name: toolUse.name,
-          input: toolUse.input,
-          inputText: this.stringifyValue(toolUse.input),
-          cwd: envelope.cwd,
-          targetPath: this.extractToolTargetPath(toolUse.name, toolUse.input),
-          command: this.extractToolCommand(toolUse.name, toolUse.input),
-          writePayload: this.extractWritePayload(toolUse.name, toolUse.input),
-        };
-        const existing = observations.get(toolUse.id);
-        observations.set(toolUse.id, {
-          ...existing,
-          ...partial,
-          resultContent: existing?.resultContent,
-          resultTokens: existing?.resultTokens,
-          estimatedTokens: existing?.estimatedTokens,
-          isError: existing?.isError,
-        });
-      }
-
-      for (const toolResult of envelope.toolResults) {
-        const existing = observations.get(toolResult.toolUseId);
-        const merged: PartialObservation = {
-          id: toolResult.toolUseId,
-          sessionId: target.sessionId,
-          filePath: target.filePath,
-          order: existing?.order ?? index,
-          timestampMs: existing?.timestampMs ?? timestampMs,
-          name: existing?.name ?? 'unknown',
-          input: existing?.input ?? {},
-          inputText: existing?.inputText ?? '',
-          cwd: existing?.cwd ?? envelope.cwd,
-          targetPath: existing?.targetPath ?? '',
-          command: existing?.command ?? '',
-          writePayload: existing?.writePayload ?? '',
-          resultContent: toolResult.content,
-          resultTokens: estimateTokenCount(toolResult.content),
-          estimatedTokens: this.estimateObservationTokens(existing?.name ?? 'unknown', existing?.input ?? {}, toolResult.content),
-          isError: toolResult.isError,
-        };
-        observations.set(toolResult.toolUseId, merged);
-      }
-    }
-
-    const normalizedObservations = Array.from(observations.values())
-      .map((item) => ({
-        id: item.id,
-        sessionId: item.sessionId,
-        filePath: item.filePath,
-        order: item.order,
-        timestampMs: item.timestampMs,
-        name: item.name,
-        input: item.input,
-        inputText: item.inputText,
-        resultContent: item.resultContent ?? '',
-        resultTokens: item.resultTokens ?? 0,
-        estimatedTokens:
-          item.estimatedTokens ?? this.estimateObservationTokens(item.name, item.input, item.resultContent ?? ''),
-        isError: item.isError ?? false,
-        cwd: item.cwd,
-        targetPath: item.targetPath,
-        command: item.command,
-        writePayload: item.writePayload,
-      }))
-      .sort((a, b) => a.order - b.order || a.timestampMs - b.timestampMs);
-
-    normalizedObservations.forEach((observation) => {
-      if (observation.estimatedTokens <= 0) {
-        return;
-      }
-      items.push({
-        order: observation.order,
-        tokenCount: observation.estimatedTokens,
-      });
-    });
-
-    return {
-      sessionId: target.sessionId,
-      filePath: target.filePath,
-      startTimestampMs,
-      endTimestampMs,
-      messages,
-      observations: normalizedObservations,
-      items,
-    };
+    return parseClaudeTranscriptSession(target);
   }
 
 
@@ -489,14 +297,20 @@ export class ContextNoiseAnalyzer {
       const lastMut = lastMutationOrder.get(normPath) ?? -1;
 
       if (prev && prev.order > lastMut) {
-        const fpMatch = this.contentFingerprint(prev.resultContent) === this.contentFingerprint(obs.resultContent);
+        const overlap = this.describeReadOverlap(prev, obs);
+        if (overlap.comparable && !overlap.overlaps) {
+          lastRead.set(normPath, obs);
+          continue;
+        }
+        const fpMatch = this.isEquivalentReadReplay(prev, obs, overlap);
         if (fpMatch) {
           const gapTokens = this.sumTokensBetween(session.items, prev.order, obs.order);
           const stepGap = obs.order - prev.order;
           const isStale = gapTokens >= STALE_INTERVENING_TOKENS || stepGap >= STALE_STEP_GAP;
 
           // Confidence: high for exact fingerprint match, slight penalty for tiny gaps
-          let confidence = 0.85;
+          let confidence = overlap.sameRange ? 0.88 : 0.78;
+          if (!overlap.sameRange && overlap.overlapRatio < 0.95) confidence -= 0.08;
           if (stepGap < 3) confidence -= 0.15; // very close re-reads may be intentional
           if (stepGap < 1) confidence -= 0.10;
 
@@ -666,7 +480,30 @@ export class ContextNoiseAnalyzer {
       const name = obs.name.toLowerCase();
       if (!TOOL_MUTATION_NAMES.has(name)) continue;
       const normPath = this.normalizePathKey(obs.targetPath);
-      if (!normPath || !obs.writePayload) continue;
+      if (!normPath) continue;
+
+      const structuredNoop =
+        (name === 'edit' || name === 'multiedit' || name === 'notebookedit') &&
+        obs.successFlag === true &&
+        obs.structuredPatchCount === 0 &&
+        obs.userModified !== true &&
+        (obs.writePayload.length > 0 || obs.oldString === obs.newString);
+
+      if (structuredNoop) {
+        events.push(this.makeEvent(session, obs, {
+          tool: 'Write', categoryKey: 'write_noop', tag: 'dup',
+          target: this.toDisplayPath(obs.targetPath),
+          tokens: Math.max(obs.estimatedTokens, estimateTokenCount(obs.writePayload)),
+          severity: obs.estimatedTokens >= 800 ? 'high' : 'medium',
+          reason: 'Edit completed without any structured patch output, so the requested change likely did not alter file state.',
+          confidence: 0.94,
+        }));
+      }
+
+      if (!obs.writePayload) {
+        lastWriteByPath.set(normPath, obs);
+        continue;
+      }
 
       const prev = lastWriteByPath.get(normPath);
       if (prev && this.isWithinDuplicateWindow(prev, obs)) {
@@ -715,15 +552,23 @@ export class ContextNoiseAnalyzer {
           confidence: 0.80,
         }));
       } else {
-        const entryCount = this.estimateEntryCount(obs.resultContent);
-        if (entryCount >= BROAD_SCAN_ENTRY_THRESHOLD && this.isRootLikeScan(obs)) {
+        const entryCount = this.estimateObservationEntryCount(obs);
+        const followupCount = this.countListingFollowups(session, obs);
+        const utilizationRatio = entryCount > 0 ? followupCount / entryCount : 0;
+        if (
+          entryCount >= BROAD_SCAN_ENTRY_THRESHOLD &&
+          this.isRootLikeScan(obs) &&
+          (obs.truncated || followupCount <= 2 || utilizationRatio < 0.12)
+        ) {
           events.push(this.makeEvent(session, obs, {
             tool: 'LS', categoryKey: 'ls_redundant', tag: 'bloat',
             target: this.toDisplayPath(obs.targetPath || obs.command || '.'),
             tokens: obs.estimatedTokens,
             severity: entryCount >= 100 ? 'high' : 'medium',
-            reason: `Broad directory scan pulled ~${entryCount} entries — consider narrowing the target path.`,
-            confidence: 0.65,
+            reason: obs.truncated
+              ? `Broad directory scan pulled ~${entryCount} entries and truncated the result. Only ${followupCount} downstream paths were used.`
+              : `Broad directory scan pulled ~${entryCount} entries, but only ${followupCount} downstream paths were used (${Math.round(utilizationRatio * 100)}% utilization).`,
+            confidence: obs.truncated ? 0.82 : Math.min(0.9, 0.62 + (utilizationRatio < 0.05 ? 0.18 : 0)),
           }));
         }
       }
@@ -751,11 +596,13 @@ export class ContextNoiseAnalyzer {
   private computeUsageScore(session: ParsedSession, obs: ToolObservation): number {
     const ev = this.scoreUsageEvidence(session, obs);
     let score = 0;
-    if (ev.pathMutation)      score += 1.0;
-    if (ev.pathMentioned)     score += 0.8;
+    if (ev.pathMutation) score += 1.0;
+    if (ev.resultPathFollowup) score += 0.95;
+    if (ev.sameDirectoryFollowup) score += 0.55;
+    if (ev.pathMentioned) score += 0.75;
     if (ev.filenameMentioned) score += 0.4;
-    if (ev.strongKeywordHit)  score += 0.5;
-    if (ev.weakKeywordHit)    score += 0.1;
+    if (ev.strongKeywordHit) score += 0.45;
+    if (ev.weakKeywordHit) score += 0.1;
     return Math.min(1, score);
   }
 
@@ -763,30 +610,50 @@ export class ContextNoiseAnalyzer {
     const normPath = this.normalizePathKey(obs.targetPath);
     const displayPath = this.toDisplayPath(obs.targetPath).toLowerCase();
     const basename = path.basename(obs.targetPath).toLowerCase();
+    const futureObservations = session.observations
+      .filter((n) => n.order > obs.order)
+      .slice(0, 25);
+    const futureMessages = session.messages
+      .filter((m) => m.order > obs.order && !m.isSynthetic)
+      .slice(0, 25);
 
     // Check for later mutation on the same path
-    const pathMutation = normPath ? session.observations.some(
-      (n) => n.order > obs.order && TOOL_MUTATION_NAMES.has(n.name.toLowerCase()) &&
+    const pathMutation = normPath ? futureObservations.some(
+      (n) => TOOL_MUTATION_NAMES.has(n.name.toLowerCase()) &&
         this.normalizePathKey(n.targetPath) === normPath
     ) : false;
 
+    const resultPathSet = new Set(
+      (obs.resultPaths.length > 0 ? obs.resultPaths : [obs.targetPath])
+        .map((candidate) => this.normalizePathKey(candidate))
+        .filter(Boolean)
+    );
+    const resultPathFollowup = resultPathSet.size > 0 && futureObservations.some((next) => {
+      const nextPath = this.normalizePathKey(next.targetPath);
+      return nextPath ? resultPathSet.has(nextPath) : false;
+    });
+    const sameDirectoryFollowup = this.hasSameDirectoryFollowup(obs, futureObservations);
+
     if (pathMutation) {
-      return { pathMutation: true, pathMentioned: false, filenameMentioned: false,
-               strongKeywordHit: false, weakKeywordHit: false };
+      return {
+        pathMutation: true,
+        resultPathFollowup,
+        sameDirectoryFollowup,
+        pathMentioned: false,
+        filenameMentioned: false,
+        strongKeywordHit: false,
+        weakKeywordHit: false,
+      };
     }
 
     // Build future text corpus (next 20 messages + next 20 tool inputs)
-    const futureMessages = session.messages
-      .filter((m) => m.order > obs.order)
-      .slice(0, 20)
+    const futureMessageText = futureMessages
       .map((m) => m.text.toLowerCase())
       .join('\n');
-    const futureInputs = session.observations
-      .filter((n) => n.order > obs.order)
-      .slice(0, 20)
+    const futureInputs = futureObservations
       .map((n) => `${n.inputText}\n${n.command}`.toLowerCase())
       .join('\n');
-    const futureText = `${futureMessages}\n${futureInputs}`;
+    const futureText = `${futureMessageText}\n${futureInputs}`;
 
     const pathMentioned = displayPath.length >= 4 && futureText.includes(displayPath);
     const filenameMentioned = basename.length >= 3 && futureText.includes(basename);
@@ -796,7 +663,15 @@ export class ContextNoiseAnalyzer {
     const strongKeywordHit = strong.some((kw) => futureText.includes(kw));
     const weakKeywordHit = !strongKeywordHit && weak.some((kw) => futureText.includes(kw));
 
-    return { pathMutation, pathMentioned, filenameMentioned, strongKeywordHit, weakKeywordHit };
+    return {
+      pathMutation,
+      resultPathFollowup,
+      sameDirectoryFollowup,
+      pathMentioned,
+      filenameMentioned,
+      strongKeywordHit,
+      weakKeywordHit,
+    };
   }
 
   // Extract keywords from content, split into strong (rare, specific) and weak (common)
@@ -826,6 +701,125 @@ export class ContextNoiseAnalyzer {
       }
     }
     return { strong: strong.slice(0, 8), weak: weak.slice(0, 8) };
+  }
+
+  private describeReadOverlap(
+    previous: ToolObservation,
+    current: ToolObservation
+  ): { comparable: boolean; overlaps: boolean; sameRange: boolean; overlapRatio: number } {
+    if (!previous.fileRange || !current.fileRange) {
+      return { comparable: false, overlaps: true, sameRange: true, overlapRatio: 1 };
+    }
+
+    const previousStart = previous.fileRange.startLine;
+    const previousEnd = previousStart + Math.max(0, previous.fileRange.numLines - 1);
+    const currentStart = current.fileRange.startLine;
+    const currentEnd = currentStart + Math.max(0, current.fileRange.numLines - 1);
+    const overlapStart = Math.max(previousStart, currentStart);
+    const overlapEnd = Math.min(previousEnd, currentEnd);
+    const overlaps = overlapStart <= overlapEnd;
+    const overlapLines = overlaps ? overlapEnd - overlapStart + 1 : 0;
+    const denominator = Math.max(1, Math.min(previous.fileRange.numLines, current.fileRange.numLines));
+    return {
+      comparable: true,
+      overlaps,
+      sameRange: previousStart === currentStart && previous.fileRange.numLines === current.fileRange.numLines,
+      overlapRatio: overlapLines / denominator,
+    };
+  }
+
+  private isEquivalentReadReplay(
+    previous: ToolObservation,
+    current: ToolObservation,
+    overlap: { comparable: boolean; overlaps: boolean; sameRange: boolean; overlapRatio: number }
+  ): boolean {
+    if (this.contentFingerprint(previous.resultContent) === this.contentFingerprint(current.resultContent)) {
+      return true;
+    }
+    if (!overlap.comparable || !overlap.overlaps || overlap.overlapRatio < 0.85) {
+      return false;
+    }
+    const previousText = this.normalizeComparableText(previous.resultContent);
+    const currentText = this.normalizeComparableText(current.resultContent);
+    if (previousText.length < 80 || currentText.length < 80) {
+      return false;
+    }
+    return previousText.includes(currentText) || currentText.includes(previousText);
+  }
+
+  private countListingFollowups(session: ParsedSession, observation: ToolObservation): number {
+    const futureObservations = session.observations
+      .filter((next) => next.order > observation.order)
+      .slice(0, 25);
+    const resultPathSet = new Set(observation.resultPaths.map((candidate) => this.normalizePathKey(candidate)).filter(Boolean));
+
+    if (resultPathSet.size > 0) {
+      const matched = new Set<string>();
+      for (const next of futureObservations) {
+        const nextPath = this.normalizePathKey(next.targetPath);
+        if (nextPath && resultPathSet.has(nextPath)) {
+          matched.add(nextPath);
+        }
+      }
+      return matched.size;
+    }
+
+    const baseDirectory = this.normalizePathKey(observation.targetPath);
+    if (!baseDirectory) {
+      return 0;
+    }
+    const matched = new Set<string>();
+    for (const next of futureObservations) {
+      const nextPath = this.normalizePathKey(next.targetPath);
+      if (nextPath && nextPath.startsWith(`${baseDirectory}\\`)) {
+        matched.add(nextPath);
+      }
+    }
+    return matched.size;
+  }
+
+  private estimateObservationEntryCount(observation: ToolObservation): number {
+    if (typeof observation.numFiles === 'number' && observation.numFiles > 0) {
+      return observation.numFiles;
+    }
+    if (observation.resultPaths.length > 0) {
+      return observation.resultPaths.length;
+    }
+    return this.estimateEntryCount(observation.resultContent);
+  }
+
+  private hasSameDirectoryFollowup(observation: ToolObservation, futureObservations: ToolObservation[]): boolean {
+    const baseDirectory = this.resolveObservationDirectory(observation);
+    if (!baseDirectory) {
+      return false;
+    }
+    return futureObservations.some((next) => {
+      const nextPath = this.normalizePathKey(next.targetPath);
+      return nextPath ? nextPath.startsWith(`${baseDirectory}\\`) : false;
+    });
+  }
+
+  private resolveObservationDirectory(observation: ToolObservation): string {
+    const normalizedPath = this.normalizePathKey(observation.targetPath);
+    if (!normalizedPath) {
+      return '';
+    }
+    if (DIRECTORY_TOOLS.has(observation.name.toLowerCase()) || this.looksLikeDirectoryPath(observation.targetPath)) {
+      return normalizedPath;
+    }
+    return this.normalizePathKey(path.dirname(observation.targetPath));
+  }
+
+  private looksLikeDirectoryPath(candidatePath: string): boolean {
+    if (!candidatePath) {
+      return false;
+    }
+    const trimmed = candidatePath.replace(/[\\/]+$/, '');
+    return path.extname(trimmed) === '';
+  }
+
+  private normalizeComparableText(text: string): string {
+    return text.replace(/\s+/g, ' ').trim().toLowerCase();
   }
 
   // -------------------------------------------------------------------------
@@ -1074,12 +1068,6 @@ export class ContextNoiseAnalyzer {
     try { return JSON.stringify(value); } catch { return String(value); }
   }
 
-  private getObjectAtPath(payload: unknown, keyPath: string[]): Record<string, unknown> | null {
-    const value = this.getValueAtPath(payload, keyPath);
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-    return value as Record<string, unknown>;
-  }
-
   private getStringAtPaths(payload: unknown, keyPaths: string[][]): string | null {
     for (const keyPath of keyPaths) {
       const value = this.getValueAtPath(payload, keyPath);
@@ -1098,208 +1086,4 @@ export class ContextNoiseAnalyzer {
     }
     return current;
   }
-
-  private parseTimestamp(value: unknown): number {
-    if (typeof value === 'number' && Number.isFinite(value)) {
-      if (value > 1000000000000) return value;
-      if (value > 1000000000) return value * 1000;
-      return 0;
-    }
-    if (typeof value !== 'string') return 0;
-    const trimmed = value.trim();
-    if (!trimmed) return 0;
-    if (/^\d+(\.\d+)?$/.test(trimmed)) {
-      const numeric = Number(trimmed);
-      if (!Number.isFinite(numeric)) return 0;
-      if (numeric > 1000000000000) return numeric;
-      if (numeric > 1000000000) return numeric * 1000;
-      return 0;
-    }
-    const parsed = Date.parse(trimmed);
-    return Number.isNaN(parsed) ? 0 : parsed;
-  }
-
-  // -------------------------------------------------------------------------
-  // JSONL parsing helpers (unchanged from original)
-  // -------------------------------------------------------------------------
-
-  private extractEnvelope(payload: unknown): {
-    role: 'user' | 'assistant' | 'system' | 'unknown';
-    text: string;
-    toolUses: Array<{ id: string; name: string; input: Record<string, unknown> }>;
-    toolResults: Array<{ toolUseId: string; content: string; isError: boolean }>;
-    timestampMs: number;
-    cwd: string;
-  } | null {
-    const direct = this.readMessageShape(payload);
-    if (direct) return direct;
-    const nestedMessage =
-      this.getObjectAtPath(payload, ['data', 'message', 'message']) ??
-      this.getObjectAtPath(payload, ['data', 'message']);
-    if (nestedMessage) {
-      const envelope = this.readMessageShape(nestedMessage, payload);
-      if (envelope) return envelope;
-    }
-    return null;
-  }
-
-  private readMessageShape(
-    messagePayload: Record<string, unknown> | unknown,
-    fallbackPayload?: unknown
-  ): {
-    role: 'user' | 'assistant' | 'system' | 'unknown';
-    text: string;
-    toolUses: Array<{ id: string; name: string; input: Record<string, unknown> }>;
-    toolResults: Array<{ toolUseId: string; content: string; isError: boolean }>;
-    timestampMs: number;
-    cwd: string;
-  } | null {
-    if (!messagePayload || typeof messagePayload !== 'object' || Array.isArray(messagePayload)) return null;
-    const record = messagePayload as Record<string, unknown>;
-    const roleValue = typeof record.role === 'string' ? record.role : '';
-    const content = record.content;
-    if (!roleValue && content === undefined) return null;
-    const role = roleValue === 'assistant' ? 'assistant'
-      : roleValue === 'user' ? 'user'
-      : roleValue === 'system' ? 'system' : 'unknown';
-    const blocks = this.normalizeContentBlocks(content);
-    const textSegments: string[] = [];
-    const toolUses: Array<{ id: string; name: string; input: Record<string, unknown> }> = [];
-    const toolResults: Array<{ toolUseId: string; content: string; isError: boolean }> = [];
-    for (const block of blocks) {
-      if (block.type === 'tool_use') {
-        if (block.id && block.name) toolUses.push({ id: block.id, name: block.name, input: block.input });
-        continue;
-      }
-      if (block.type === 'tool_result') {
-        if (block.toolUseId) toolResults.push({ toolUseId: block.toolUseId, content: block.text, isError: block.isError });
-        continue;
-      }
-      if (block.text) textSegments.push(block.text);
-    }
-    const text = this.normalizeMessageText(textSegments.join('\n'));
-    const timestampMs =
-      this.parseTimestamp(record.timestamp) ||
-      this.parseTimestamp(this.getValueAtPath(fallbackPayload, ['data', 'message', 'timestamp'])) ||
-      this.parseTimestamp(this.getValueAtPath(fallbackPayload, ['timestamp'])) || 0;
-    const cwd = this.getStringAtPaths(fallbackPayload, [['cwd']]) ?? this.getStringAtPaths(record, [['cwd']]) ?? '';
-    return { role, text, toolUses, toolResults, timestampMs, cwd };
-  }
-
-  private normalizeContentBlocks(content: unknown): Array<{
-    type: 'text' | 'tool_use' | 'tool_result';
-    text: string; id: string; name: string;
-    input: Record<string, unknown>; toolUseId: string; isError: boolean;
-  }> {
-    if (typeof content === 'string') {
-      return [{ type: 'text', text: content, id: '', name: '', input: {}, toolUseId: '', isError: false }];
-    }
-    if (!Array.isArray(content)) return [];
-    return content.map((item) => {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
-      const record = item as Record<string, unknown>;
-      const type = typeof record.type === 'string' ? record.type : 'text';
-      if (type === 'tool_use') {
-        return {
-          type: 'tool_use' as const, text: '',
-          id: typeof record.id === 'string' ? record.id : '',
-          name: typeof record.name === 'string' ? record.name : '',
-          input: record.input && typeof record.input === 'object' && !Array.isArray(record.input)
-            ? (record.input as Record<string, unknown>) : {},
-          toolUseId: '', isError: false,
-        };
-      }
-      if (type === 'tool_result') {
-        return {
-          type: 'tool_result' as const,
-          text: this.normalizeToolResultContent(record.content),
-          id: '', name: '', input: {},
-          toolUseId: typeof record.tool_use_id === 'string' ? record.tool_use_id : '',
-          isError: record.is_error === true,
-        };
-      }
-      return {
-        type: 'text' as const,
-        text: typeof record.text === 'string' ? record.text : typeof record.content === 'string' ? record.content : '',
-        id: '', name: '', input: {}, toolUseId: '', isError: false,
-      };
-    }).filter((item): item is {
-      type: 'text' | 'tool_use' | 'tool_result';
-      text: string; id: string; name: string;
-      input: Record<string, unknown>; toolUseId: string; isError: boolean;
-    } => item !== null);
-  }
-
-  private normalizeToolResultContent(content: unknown): string {
-    if (typeof content === 'string') return content.trim();
-    if (Array.isArray(content)) {
-      return content.map((item) => {
-        if (typeof item === 'string') return item;
-        if (item && typeof item === 'object' && !Array.isArray(item)) {
-          const record = item as Record<string, unknown>;
-          if (typeof record.text === 'string') return record.text;
-          if (typeof record.content === 'string') return record.content;
-        }
-        return '';
-      }).join('\n').trim();
-    }
-    return '';
-  }
-
-  private normalizeMessageText(input: string): string {
-    const normalized = input.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-    if (!normalized) return '';
-    if (normalized.includes('<local-command-caveat>') ||
-        normalized.includes('<local-command-stdout>') ||
-        normalized.includes('<command-name>')) return '';
-    return normalized;
-  }
-
-  private estimateObservationTokens(name: string, input: Record<string, unknown>, resultContent: string): number {
-    const resultTokens = estimateTokenCount(resultContent);
-    const inputTokens = estimateTokenCount(this.stringifyValue(input));
-    const writeTokens = estimateTokenCount(this.extractWritePayload(name, input));
-    const minimumToolFootprint = name.toLowerCase() === 'read' ? 0 : 12;
-    return Math.max(resultTokens, inputTokens, writeTokens, minimumToolFootprint);
-  }
-
-  private extractToolTargetPath(name: string, input: Record<string, unknown>): string {
-    return (
-      this.getStringAtPaths(input, [['file_path'], ['filePath'], ['path'], ['directory'], ['dir'], ['cwd']]) ??
-      (name.toLowerCase() === 'bash' ? this.extractPathFromCommand(this.extractToolCommand(name, input)) : '') ??
-      ''
-    );
-  }
-
-  private extractToolCommand(name: string, input: Record<string, unknown>): string {
-    if (name.toLowerCase() !== 'bash') return this.getStringAtPaths(input, [['description']]) ?? '';
-    return this.getStringAtPaths(input, [['command'], ['cmd']]) ?? '';
-  }
-
-  private extractWritePayload(name: string, input: Record<string, unknown>): string {
-    if (!TOOL_MUTATION_NAMES.has(name.toLowerCase())) return '';
-    const direct = this.getStringAtPaths(input, [['content'], ['new_string'], ['newString'], ['newText'], ['text'], ['patch']]) ?? '';
-    if (direct) return direct;
-    const edits = this.getValueAtPath(input, ['edits']);
-    if (Array.isArray(edits)) {
-      return edits.map((item) => {
-        if (!item || typeof item !== 'object' || Array.isArray(item)) return '';
-        const record = item as Record<string, unknown>;
-        return [
-          typeof record.old_string === 'string' ? record.old_string : '',
-          typeof record.new_string === 'string' ? record.new_string : '',
-        ].filter(Boolean).join('\n');
-      }).filter(Boolean).join('\n');
-    }
-    return '';
-  }
-
-  private extractPathFromCommand(command: string): string {
-    if (!command) return '';
-    const quoted = command.match(/["']([A-Za-z]:[\\/][^"']+|\.{0,2}[\\/][^"']+)["']/);
-    if (quoted?.[1]) return quoted[1];
-    const bare = command.match(/(?:ls|dir|tree|find|Get-ChildItem|rg --files)\s+([A-Za-z]:[\\/][^\s]+|\.{0,2}[\\/][^\s]+)/i);
-    return bare?.[1] ?? '';
-  }
 }
-

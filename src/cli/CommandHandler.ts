@@ -1,9 +1,12 @@
+import { execFile } from 'child_process';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 import { createElement } from 'react';
+import { promisify } from 'util';
 import chalk from 'chalk';
 import boxen from 'boxen';
+import inquirer from 'inquirer';
 import { ConversationManager } from './ConversationManager.js';
 import { UIRenderer } from './UIRenderer.js';
 import { CommandRegistry } from './CommandRegistry.js';
@@ -27,6 +30,8 @@ import { TokenStructureScreen } from './ink/TokenStructureScreen.js';
 import { renderStaticInkScreen } from './ink/renderInkScreen.js';
 import { ClaudeTokenizer } from '../llm/ClaudeTokenizer.js';
 import { getProviderMeta } from '../config/providerCatalog.js';
+
+const execFileAsync = promisify(execFile);
 
 type ContextAnatomySegmentKey = 'system' | 'prompt_library' | 'reference_docs' | 'chat_history' | 'active_request';
 
@@ -71,10 +76,13 @@ type AnatomyBucket = {
 };
 
 type TokenScanScope = 'current' | 'all' | 'path';
+type TokenScanSource = 'claude' | 'codex';
 
 type TokenScanRequest = {
+  source: TokenScanSource;
   scope: TokenScanScope;
   rawPath?: string;
+  explicitSource?: boolean;
 };
 
 type TokenFieldAggregate = {
@@ -121,6 +129,7 @@ type TokenStructureSummary = {
 };
 
 type TokenScanTarget = {
+  source: TokenScanSource;
   scopeLabel: string;
   sourceLabel: string;
   projectDirs: string[];
@@ -244,6 +253,147 @@ type PromptScanPresentation = {
   anatomyView: ContextAnatomyView;
 };
 
+type StateGitSummary = {
+  available: boolean;
+  repoRoot: string;
+  branch: string;
+  clean: boolean;
+  changedFiles: number;
+  stagedFiles: number;
+  unstagedFiles: number;
+  untrackedFiles: number;
+  ahead: number;
+  behind: number;
+};
+
+type StateProjectAssetSummary = {
+  packageLabel: string;
+  packageManager: string;
+  scriptCount: number;
+  hasBuildScript: boolean;
+  hasTestScript: boolean;
+  hasLintScript: boolean;
+  hasTypecheckScript: boolean;
+  hasReadme: boolean;
+  hasSrcDir: boolean;
+  hasTestsDir: boolean;
+  hasTsConfig: boolean;
+  hasEnvExample: boolean;
+  hasWorkspaceClaude: boolean;
+  hasWorkspaceCodex: boolean;
+  hasAgentsFile: boolean;
+  hasClaudeFile: boolean;
+  hasOdradekDir: boolean;
+  promptAssetCount: number;
+  promptFileCount: number;
+  systemPromptCount: number;
+  projectConfigCount: number;
+  docsAssetCount: number;
+  ruleFileCount: number;
+  totalRules: number;
+  skillCount: number;
+  skillResourceFiles: number;
+};
+
+type ExportFormat = 'json';
+
+type ExportCommandName =
+  | 'state'
+  | 'noise_eval'
+  | 'context_health'
+  | 'scan_tokens'
+  | 'rules'
+  | 'skills'
+  | 'scan_prompt'
+  | 'todo_granularity';
+
+type ExportSelection = ExportCommandName | 'all';
+
+type ExportCommandEnvelope = {
+  command: ExportCommandName;
+  invocation: string;
+  status: 'ok' | 'error';
+  data?: unknown;
+  error?: string;
+};
+
+type ExportDocument = {
+  schemaVersion: 1;
+  format: ExportFormat;
+  generatedAt: string;
+  workspacePath: string;
+  selectedSource: TokenScanSource;
+  selectedCommand: ExportSelection;
+  commands: ExportCommandEnvelope[];
+};
+
+type StateExportData = {
+  scopeLabel: 'current_project';
+  workspacePath: string;
+  configPath: string;
+  trusted: boolean;
+  runtimeStatus: string;
+  provider: {
+    activeProvider: string;
+    displayName: string;
+    sourceLabel: string;
+    runtimeSourceLabel: string;
+  };
+  projectContext: {
+    enabled: boolean;
+    sourceLabel: string;
+  };
+  apiKey: {
+    configured: boolean;
+    sourceLabel: string;
+  };
+  model: {
+    value: string;
+    sourceLabel: string;
+  };
+  endpoint: {
+    value: string;
+    sourceLabel: string;
+  };
+  envFiles: {
+    loaded: boolean;
+    label: string;
+    paths: string[];
+  };
+  sessionOverrides: string[];
+  git: StateGitSummary;
+  project: StateProjectAssetSummary;
+};
+
+type PromptScanExportData = {
+  scopeLabel: 'current_project';
+  tokenizerModeLabel: string;
+  tokenizerWarning?: string;
+  result: PromptScanResult;
+  anatomyView: ContextAnatomyView;
+};
+
+type TokenScanExportData = {
+  target: TokenScanTarget;
+  summary: TokenStructureSummary;
+};
+
+type ContextHealthExportData = {
+  target: TokenScanTarget;
+  records: ContextUsageRecord[];
+  snapshot: ContextHealthSnapshot | null;
+};
+
+type NoiseEvaluationExportData = {
+  target: TokenScanTarget;
+  report: NoiseEvaluationReport | null;
+};
+
+type TodoGranularityExportData = {
+  target: TokenScanTarget;
+  analysis: TodoGranularityAnalysis | null;
+};
+
 export class CommandHandler {
   private static readonly ANATOMY_BAR_WIDTH = 28;
   private static readonly MAX_CLAUDE_HISTORY_FILES = 6;
@@ -356,7 +506,7 @@ export class CommandHandler {
         this.analyzeConversation();
         break;
       case 'export':
-        this.exportConversation(args);
+        await this.exportConversation(args);
         break;
       case 'model':
         await this.onModelSwitch(args);
@@ -438,10 +588,12 @@ export class CommandHandler {
     const currentPath = process.cwd();
 
     try {
-      const [config, diagnostics, trusted] = await Promise.all([
+      const [config, diagnostics, trusted, gitSummary, projectSummary] = await Promise.all([
         this.configStore.getConfig(),
         this.configStore.getConfigDiagnostics(),
         this.configStore.isPathTrusted(currentPath),
+        this.inspectStateGit(currentPath),
+        this.collectStateProjectAssetSummary(currentPath),
       ]);
 
       const activeProvider = config.activeProvider;
@@ -481,6 +633,8 @@ export class CommandHandler {
             envFilesLabel: envFiles,
             envFilesLoaded: diagnostics.loadedEnvFiles.length > 0,
             sessionOverrides,
+            git: gitSummary,
+            project: projectSummary,
           })
         );
       } catch {
@@ -517,6 +671,43 @@ export class CommandHandler {
           ),
           this.formatStateLine('Endpoint', endpointValue, 'muted', endpointSourceLabel),
           this.formatStateLine('Env files', envFiles, diagnostics.loadedEnvFiles.length > 0 ? 'accent' : 'muted'),
+          this.formatStateLine(
+            'Git',
+            gitSummary.available ? (gitSummary.clean ? 'clean' : 'dirty') : 'not a repo',
+            gitSummary.available ? (gitSummary.clean ? 'success' : 'warning') : 'muted',
+            gitSummary.available ? `${gitSummary.branch} · ${gitSummary.changedFiles} changed` : undefined
+          ),
+          this.formatStateLine('Package', projectSummary.packageLabel, projectSummary.packageLabel === 'missing' ? 'warning' : 'default'),
+          this.formatStateLine(
+            'Scripts',
+            `${projectSummary.scriptCount}`,
+            projectSummary.scriptCount > 0 ? 'default' : 'warning',
+            [
+              projectSummary.hasBuildScript ? 'build' : null,
+              projectSummary.hasTestScript ? 'test' : null,
+              projectSummary.hasLintScript ? 'lint' : null,
+              projectSummary.hasTypecheckScript ? 'typecheck' : null,
+            ]
+              .filter(Boolean)
+              .join(', ') || 'none'
+          ),
+          this.formatStateLine(
+            'Rules',
+            `${projectSummary.ruleFileCount} files / ${projectSummary.totalRules} rules`,
+            projectSummary.totalRules > 0 ? 'success' : 'muted'
+          ),
+          this.formatStateLine(
+            'Prompts',
+            `${projectSummary.promptAssetCount} assets`,
+            projectSummary.promptAssetCount > 0 ? 'accent' : 'muted',
+            `${projectSummary.systemPromptCount} system`
+          ),
+          this.formatStateLine(
+            'Skills',
+            `${projectSummary.skillCount}`,
+            projectSummary.skillCount > 0 ? 'accent' : 'muted',
+            `${projectSummary.skillResourceFiles} resource files`
+          ),
         ];
 
         if (sessionOverrides.length > 0) {
@@ -560,6 +751,19 @@ export class CommandHandler {
           `endpointSource=${providerSources.baseUrl}`,
           `envFiles=${envFiles}`,
           `sessionOverrides=${sessionOverrides.join(', ') || '(none)'}`,
+          `gitAvailable=${gitSummary.available}`,
+          `gitBranch=${gitSummary.branch}`,
+          `gitClean=${gitSummary.clean}`,
+          `gitChangedFiles=${gitSummary.changedFiles}`,
+          `package=${projectSummary.packageLabel}`,
+          `packageManager=${projectSummary.packageManager}`,
+          `scriptCount=${projectSummary.scriptCount}`,
+          `rules=${projectSummary.ruleFileCount}/${projectSummary.totalRules}`,
+          `prompts=${projectSummary.promptAssetCount}`,
+          `skills=${projectSummary.skillCount}`,
+          `workspaceClaude=${projectSummary.hasWorkspaceClaude}`,
+          `workspaceCodex=${projectSummary.hasWorkspaceCodex}`,
+          `odradekDir=${projectSummary.hasOdradekDir}`,
         ].join('\n')
       );
     } catch (error) {
@@ -574,6 +778,332 @@ export class CommandHandler {
     console.clear();
     this.uiRenderer.renderSuccess('Conversation history cleared');
     this.recordCommandData('clear', 'Conversation history cleared.');
+  }
+
+  private async inspectStateGit(workspacePath: string): Promise<StateGitSummary> {
+    const fallback: StateGitSummary = {
+      available: false,
+      repoRoot: '',
+      branch: 'n/a',
+      clean: true,
+      changedFiles: 0,
+      stagedFiles: 0,
+      unstagedFiles: 0,
+      untrackedFiles: 0,
+      ahead: 0,
+      behind: 0,
+    };
+
+    try {
+      const repoRootResult = await execFileAsync('git', ['rev-parse', '--show-toplevel'], {
+        cwd: workspacePath,
+        windowsHide: true,
+        timeout: 5000,
+      });
+      const repoRoot = repoRootResult.stdout.trim();
+      if (!repoRoot) {
+        return fallback;
+      }
+
+      const statusResult = await execFileAsync('git', ['status', '--porcelain=v1', '--branch'], {
+        cwd: repoRoot,
+        windowsHide: true,
+        timeout: 5000,
+      });
+
+      const lines = statusResult.stdout.replace(/\r\n/g, '\n').split('\n').filter(Boolean);
+      const header = lines[0]?.startsWith('## ') ? lines.shift() ?? '' : '';
+      let branch = 'detached';
+      let ahead = 0;
+      let behind = 0;
+
+      if (header) {
+        const headerBody = header.slice(3).trim();
+        const branchPart = headerBody.split(' [')[0]?.trim() ?? headerBody;
+        branch = branchPart.split('...')[0]?.trim() || 'detached';
+        if (/^head\b/i.test(branch)) {
+          branch = 'detached';
+        }
+        const aheadMatch = headerBody.match(/ahead (\d+)/i);
+        const behindMatch = headerBody.match(/behind (\d+)/i);
+        ahead = aheadMatch ? Number(aheadMatch[1]) : 0;
+        behind = behindMatch ? Number(behindMatch[1]) : 0;
+      }
+
+      let stagedFiles = 0;
+      let unstagedFiles = 0;
+      let untrackedFiles = 0;
+
+      for (const line of lines) {
+        if (line.startsWith('?? ')) {
+          untrackedFiles += 1;
+          continue;
+        }
+        const x = line[0] ?? ' ';
+        const y = line[1] ?? ' ';
+        if (x !== ' ') {
+          stagedFiles += 1;
+        }
+        if (y !== ' ') {
+          unstagedFiles += 1;
+        }
+      }
+
+      return {
+        available: true,
+        repoRoot,
+        branch,
+        clean: lines.length === 0,
+        changedFiles: lines.length,
+        stagedFiles,
+        unstagedFiles,
+        untrackedFiles,
+        ahead,
+        behind,
+      };
+    } catch {
+      return fallback;
+    }
+  }
+
+  private async collectStateProjectAssetSummary(workspacePath: string): Promise<StateProjectAssetSummary> {
+    const resolvedWorkspace = path.resolve(workspacePath);
+    const [
+      packageJsonRaw,
+      hasReadme,
+      hasSrcDir,
+      hasTestsDir,
+      hasTsConfig,
+      hasEnvExample,
+      hasWorkspaceClaude,
+      hasWorkspaceCodex,
+      hasAgentsFile,
+      hasClaudeFile,
+      hasOdradekDir,
+      promptScan,
+      rulesScan,
+      skillsScan,
+      hasPackageLock,
+      hasPnpmLock,
+      hasYarnLock,
+      hasBunLock,
+    ] = await Promise.all([
+      this.readUtf8FileIfExists(path.join(resolvedWorkspace, 'package.json')),
+      this.hasMatchingRootFile(resolvedWorkspace, [/^readme(?:\.[^.]+)?$/i]),
+      this.hasAnyRootDirectory(resolvedWorkspace, ['src', 'app', 'lib']),
+      this.hasAnyRootDirectory(resolvedWorkspace, ['test', 'tests', '__tests__', 'spec', 'specs']),
+      this.hasAnyRootFile(resolvedWorkspace, ['tsconfig.json', 'tsconfig.base.json']),
+      this.hasAnyRootFile(resolvedWorkspace, ['.env.example', '.env.sample', '.env.template', '.env.local.example']),
+      this.isDirectory(path.join(resolvedWorkspace, '.claude')),
+      this.isDirectory(path.join(resolvedWorkspace, '.codex')),
+      this.hasAnyRootFile(resolvedWorkspace, ['AGENTS.md']),
+      this.hasAnyRootFile(resolvedWorkspace, ['CLAUDE.md']),
+      this.isDirectory(path.join(resolvedWorkspace, '.odradek')),
+      this.safePromptAssetScan(resolvedWorkspace),
+      this.safeRuleScan(resolvedWorkspace),
+      this.safeSkillScan(resolvedWorkspace),
+      this.hasAnyRootFile(resolvedWorkspace, ['package-lock.json']),
+      this.hasAnyRootFile(resolvedWorkspace, ['pnpm-lock.yaml']),
+      this.hasAnyRootFile(resolvedWorkspace, ['yarn.lock']),
+      this.hasAnyRootFile(resolvedWorkspace, ['bun.lockb']),
+    ]);
+
+    let packageLabel = 'missing';
+    let packageManager = 'none';
+    let scriptCount = 0;
+    let hasBuildScript = false;
+    let hasTestScript = false;
+    let hasLintScript = false;
+    let hasTypecheckScript = false;
+
+    if (packageJsonRaw) {
+      try {
+        const parsed = JSON.parse(packageJsonRaw) as Record<string, unknown>;
+        const packageName = typeof parsed.name === 'string' ? parsed.name.trim() : '';
+        const packageVersion = typeof parsed.version === 'string' ? parsed.version.trim() : '';
+        packageLabel = packageName ? (packageVersion ? `${packageName}@${packageVersion}` : packageName) : 'package.json';
+        packageManager = this.resolveStatePackageManager(
+          typeof parsed.packageManager === 'string' ? parsed.packageManager.trim() : '',
+          {
+            hasPackageLock,
+            hasPnpmLock,
+            hasYarnLock,
+            hasBunLock,
+          }
+        );
+
+        const scripts =
+          parsed.scripts && typeof parsed.scripts === 'object' && !Array.isArray(parsed.scripts)
+            ? (parsed.scripts as Record<string, unknown>)
+            : {};
+        const scriptNames = Object.keys(scripts);
+        scriptCount = scriptNames.length;
+        hasBuildScript = scriptNames.some((name) => name === 'build' || name.startsWith('build:'));
+        hasTestScript = scriptNames.some((name) => name === 'test' || name.startsWith('test:'));
+        hasLintScript = scriptNames.some((name) => name === 'lint' || name.startsWith('lint:'));
+        hasTypecheckScript = scriptNames.some(
+          (name) => name === 'typecheck' || name.startsWith('typecheck:') || name === 'check-types'
+        );
+      } catch {
+        packageLabel = 'package.json (invalid)';
+        packageManager = this.resolveStatePackageManager('', {
+          hasPackageLock,
+          hasPnpmLock,
+          hasYarnLock,
+          hasBunLock,
+        });
+      }
+    }
+
+    const promptAssetCount = promptScan.files.length;
+    const promptFileCount = promptScan.files.filter((file) => file.categories.includes('prompt-file')).length;
+    const systemPromptCount = promptScan.files.filter((file) => file.categories.includes('system-prompt')).length;
+    const projectConfigCount = promptScan.files.filter((file) => file.categories.includes('project-config')).length;
+    const docsAssetCount = promptScan.files.filter((file) => file.categories.includes('docs')).length;
+
+    return {
+      packageLabel,
+      packageManager,
+      scriptCount,
+      hasBuildScript,
+      hasTestScript,
+      hasLintScript,
+      hasTypecheckScript,
+      hasReadme,
+      hasSrcDir,
+      hasTestsDir,
+      hasTsConfig,
+      hasEnvExample,
+      hasWorkspaceClaude,
+      hasWorkspaceCodex,
+      hasAgentsFile,
+      hasClaudeFile,
+      hasOdradekDir,
+      promptAssetCount,
+      promptFileCount,
+      systemPromptCount,
+      projectConfigCount,
+      docsAssetCount,
+      ruleFileCount: rulesScan.matchedFileCount,
+      totalRules: rulesScan.totalRules,
+      skillCount: skillsScan.skills.length,
+      skillResourceFiles: skillsScan.totalResourceFiles,
+    };
+  }
+
+  private resolveStatePackageManager(
+    packageManagerField: string,
+    lockfiles: { hasPackageLock: boolean; hasPnpmLock: boolean; hasYarnLock: boolean; hasBunLock: boolean }
+  ): string {
+    if (packageManagerField) {
+      return packageManagerField.split('@')[0] || packageManagerField;
+    }
+    if (lockfiles.hasPnpmLock) {
+      return 'pnpm';
+    }
+    if (lockfiles.hasYarnLock) {
+      return 'yarn';
+    }
+    if (lockfiles.hasBunLock) {
+      return 'bun';
+    }
+    if (lockfiles.hasPackageLock) {
+      return 'npm';
+    }
+    return 'none';
+  }
+
+  private async safePromptAssetScan(rootPath: string): Promise<PromptScanResult> {
+    try {
+      return await this.promptAssetScanner.scan(rootPath);
+    } catch {
+      return {
+        rootPath: path.resolve(rootPath),
+        scannedFileCount: 0,
+        files: [],
+      };
+    }
+  }
+
+  private async safeRuleScan(rootPath: string): Promise<RulesScanResult> {
+    try {
+      return await this.ruleScanner.scan(rootPath);
+    } catch {
+      return {
+        rootPath: path.resolve(rootPath),
+        scannedFileCount: 0,
+        candidateFileCount: 0,
+        matchedFileCount: 0,
+        totalRules: 0,
+        files: [],
+      };
+    }
+  }
+
+  private async safeSkillScan(rootPath: string): Promise<SkillScanResult> {
+    try {
+      return await this.skillScanner.scan(rootPath);
+    } catch {
+      return {
+        rootPath: path.resolve(rootPath),
+        scannedFileCount: 0,
+        skills: [],
+        totalResourceFiles: 0,
+      };
+    }
+  }
+
+  private async readUtf8FileIfExists(filePath: string): Promise<string | null> {
+    try {
+      return await fs.readFile(filePath, 'utf8');
+    } catch {
+      return null;
+    }
+  }
+
+  private async hasAnyRootFile(rootPath: string, names: string[]): Promise<boolean> {
+    for (const name of names) {
+      if (await this.isFile(path.join(rootPath, name))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async hasMatchingRootFile(rootPath: string, patterns: RegExp[]): Promise<boolean> {
+    try {
+      const entries = await fs.readdir(rootPath, { withFileTypes: true });
+      return entries.some((entry) => entry.isFile() && patterns.some((pattern) => pattern.test(entry.name)));
+    } catch {
+      return false;
+    }
+  }
+
+  private async hasAnyRootDirectory(rootPath: string, names: string[]): Promise<boolean> {
+    for (const name of names) {
+      if (await this.isDirectory(path.join(rootPath, name))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async isFile(filePath: string): Promise<boolean> {
+    try {
+      const stat = await fs.stat(filePath);
+      return stat.isFile();
+    } catch {
+      return false;
+    }
+  }
+
+  private async isDirectory(filePath: string): Promise<boolean> {
+    try {
+      const stat = await fs.stat(filePath);
+      return stat.isDirectory();
+    } catch {
+      return false;
+    }
   }
 
   private showHistory(): void {
@@ -628,22 +1158,498 @@ export class CommandHandler {
     this.recordCommandData('analyze', `total=${total}, user=${userCount}, assistant=${assistantCount}`);
   }
 
-  private exportConversation(args: string[]): void {
-    const filename = args[0] || 'conversation.json';
-    this.uiRenderer.renderInfo(`Export is not implemented yet (filename: ${filename})`);
-    this.recordCommandData('export', `Export not implemented. Requested filename: ${filename}`);
-  }
-
-  private async scanTokenStructures(args: string[]): Promise<void> {
+  private async exportConversation(args: string[]): Promise<void> {
+    const source = await this.resolveExportSource(args[0]);
+    const selection = await this.resolveExportSelection(args[1]);
+    const format: ExportFormat = 'json';
     const spinner = process.stdout.isTTY ? new Spinner() : null;
+    const selectionLabel = selection === 'all' ? '/all' : `/${selection}`;
+
     if (spinner) {
-      spinner.start('Parsing Claude JSONL token structures...');
+      spinner.start(`Exporting ${selectionLabel} diagnostics as ${format.toUpperCase()}...`);
     } else {
-      this.uiRenderer.renderInfo('Parsing Claude JSONL token structures...');
+      this.uiRenderer.renderInfo(`Exporting ${selectionLabel} diagnostics as ${format.toUpperCase()}...`);
     }
 
     try {
-      const request = this.parseTokenScanRequest(args);
+      const document = await this.buildExportDocument(source, selection, format);
+      const outputPath = await this.writeExportDocument(document, source, selection, format);
+      const exportedCommands = document.commands.map((entry) => `/${entry.command}`);
+      const failedCommands = document.commands.filter((entry) => entry.status === 'error');
+
+      if (spinner) {
+        spinner.stop('Export completed');
+      } else {
+        this.uiRenderer.renderSuccess('Export completed');
+      }
+
+      this.uiRenderer.renderSuccess(`JSON export saved to ${outputPath}`);
+      this.uiRenderer.renderInfo(`Exported ${exportedCommands.join(', ')}`);
+      if (failedCommands.length > 0) {
+        this.uiRenderer.renderWarning(
+          `${failedCommands.length} section(s) failed and were captured with error metadata in the export file`
+        );
+      }
+
+      this.recordCommandData(
+        'export',
+        [
+          `format=${format}`,
+          `source=${source}`,
+          `selection=${selection}`,
+          `commands=${exportedCommands.join(',')}`,
+          `failed=${failedCommands.length}`,
+          `path=${outputPath}`,
+        ].join('\n')
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to export diagnostic data';
+      if (spinner) {
+        spinner.fail(message);
+      } else {
+        this.uiRenderer.renderError(message);
+      }
+      this.recordCommandData('export', `failed: ${message}`);
+    }
+  }
+
+  private async resolveExportSource(input: string | undefined): Promise<TokenScanSource> {
+    const normalized = this.normalizeExportSource(input);
+    if (normalized) {
+      return normalized;
+    }
+
+    if (input && input.trim()) {
+      throw new Error('Invalid source. Usage: /export [claude|codex]');
+    }
+
+    if (!process.stdout.isTTY) {
+      throw new Error('Missing source. Usage: /export [claude|codex]');
+    }
+
+    const { selectedSource } = await inquirer.prompt<{ selectedSource: TokenScanSource }>([
+      {
+        type: 'list',
+        name: 'selectedSource',
+        message: 'Select the session source to export',
+        choices: [
+          { name: 'Claude', value: 'claude' },
+          { name: 'Codex', value: 'codex' },
+        ],
+      },
+    ]);
+
+    return selectedSource;
+  }
+
+  private normalizeExportSource(input: string | undefined): TokenScanSource | null {
+    const normalized = (input ?? '').trim().toLowerCase();
+    if (normalized === 'claude') {
+      return 'claude';
+    }
+    if (normalized === 'codex') {
+      return 'codex';
+    }
+    return null;
+  }
+
+  private async resolveExportSelection(input: string | undefined): Promise<ExportSelection> {
+    const normalized = this.normalizeExportSelection(input);
+    if (normalized) {
+      return normalized;
+    }
+
+    if (input && input.trim()) {
+      throw new Error(
+        'Invalid export target. Use one of /state, /noise_eval, /context_health, /scan_tokens, /rules, /skills, /scan_prompt, /todo_granularity, /all'
+      );
+    }
+
+    if (!process.stdout.isTTY) {
+      throw new Error(
+        'Missing export target. Re-run with a TTY or pass one of /state, /noise_eval, /context_health, /scan_tokens, /rules, /skills, /scan_prompt, /todo_granularity, /all'
+      );
+    }
+
+    const { selectedCommand } = await inquirer.prompt<{ selectedCommand: ExportSelection }>([
+      {
+        type: 'list',
+        name: 'selectedCommand',
+        message: 'Select the diagnostic dataset to export',
+        choices: [
+          { name: '/state  current project and runtime status', value: 'state' },
+          { name: '/noise_eval  evidence-first noise evaluation', value: 'noise_eval' },
+          { name: '/context_health  context window health snapshot', value: 'context_health' },
+          { name: '/scan_tokens  token structure analytics', value: 'scan_tokens' },
+          { name: '/rules  explicit workspace rules and instruction lines', value: 'rules' },
+          { name: '/skills  local SKILL.md inventory and support files', value: 'skills' },
+          { name: '/scan_prompt  prompt and system-prompt asset scan', value: 'scan_prompt' },
+          { name: '/todo_granularity  todo granularity vs context usage', value: 'todo_granularity' },
+          { name: '/all  export every supported dataset above', value: 'all' },
+        ],
+      },
+    ]);
+
+    return selectedCommand;
+  }
+
+  private normalizeExportSelection(input: string | undefined): ExportSelection | null {
+    const normalized = (input ?? '').trim().toLowerCase().replace(/^\//, '');
+    const allowed = new Set<ExportSelection>([
+      'state',
+      'noise_eval',
+      'context_health',
+      'scan_tokens',
+      'rules',
+      'skills',
+      'scan_prompt',
+      'todo_granularity',
+      'all',
+    ]);
+    return allowed.has(normalized as ExportSelection) ? (normalized as ExportSelection) : null;
+  }
+
+  private expandExportSelection(selection: ExportSelection): ExportCommandName[] {
+    if (selection === 'all') {
+      return [
+        'state',
+        'noise_eval',
+        'context_health',
+        'scan_tokens',
+        'rules',
+        'skills',
+        'scan_prompt',
+        'todo_granularity',
+      ];
+    }
+
+    return [selection];
+  }
+
+  private async buildExportDocument(
+    source: TokenScanSource,
+    selection: ExportSelection,
+    format: ExportFormat
+  ): Promise<ExportDocument> {
+    const commands = this.expandExportSelection(selection);
+    const envelopes: ExportCommandEnvelope[] = [];
+
+    for (const command of commands) {
+      const invocation = this.buildExportInvocation(command, source);
+      try {
+        const data = await this.collectExportCommandData(command, source);
+        envelopes.push({
+          command,
+          invocation,
+          status: 'ok',
+          data,
+        });
+      } catch (error) {
+        envelopes.push({
+          command,
+          invocation,
+          status: 'error',
+          error: error instanceof Error ? error.message : `Failed to export /${command}`,
+        });
+      }
+    }
+
+    return {
+      schemaVersion: 1,
+      format,
+      generatedAt: new Date().toISOString(),
+      workspacePath: path.resolve(process.cwd()),
+      selectedSource: source,
+      selectedCommand: selection,
+      commands: envelopes,
+    };
+  }
+
+  private buildExportInvocation(command: ExportCommandName, source: TokenScanSource): string {
+    if (
+      command === 'noise_eval' ||
+      command === 'context_health' ||
+      command === 'scan_tokens' ||
+      command === 'todo_granularity'
+    ) {
+      return `/${command} ${source}`;
+    }
+
+    return `/${command}`;
+  }
+
+  private async collectExportCommandData(command: ExportCommandName, source: TokenScanSource): Promise<unknown> {
+    switch (command) {
+      case 'state':
+        return this.collectStateExportData();
+      case 'noise_eval':
+        return this.collectNoiseEvaluationExportData(source);
+      case 'context_health':
+        return this.collectContextHealthExportData(source);
+      case 'scan_tokens':
+        return this.collectTokenScanExportData(source);
+      case 'rules':
+        return {
+          scopeLabel: 'current_project' as const,
+          result: await this.ruleScanner.scan(process.cwd()),
+        };
+      case 'skills':
+        return {
+          scopeLabel: 'current_project' as const,
+          result: await this.skillScanner.scan(process.cwd()),
+        };
+      case 'scan_prompt':
+        return this.collectPromptScanExportData();
+      case 'todo_granularity':
+        return this.collectTodoGranularityExportData(source);
+      default:
+        return null;
+    }
+  }
+
+  private async collectStateExportData(): Promise<StateExportData> {
+    const currentPath = process.cwd();
+    const [config, diagnostics, trusted, gitSummary, projectSummary] = await Promise.all([
+      this.configStore.getConfig(),
+      this.configStore.getConfigDiagnostics(),
+      this.configStore.isPathTrusted(currentPath),
+      this.inspectStateGit(currentPath),
+      this.collectStateProjectAssetSummary(currentPath),
+    ]);
+
+    const activeProvider = config.activeProvider;
+    const providerMeta = getProviderMeta(activeProvider);
+    const providerConfig = config.providers[activeProvider] ?? {};
+    const providerSources = diagnostics.providerSources[activeProvider];
+    const apiKeyConfigured = Boolean(providerConfig.apiKey?.trim());
+    const modelValue = providerConfig.model?.trim() || 'Not set';
+    const endpointValue = providerConfig.baseUrl?.trim() || providerMeta.defaultBaseUrl;
+    const runtimeStatus = apiKeyConfigured && providerConfig.model?.trim() ? 'ready' : 'needs setup';
+
+    return {
+      scopeLabel: 'current_project',
+      workspacePath: path.resolve(currentPath),
+      configPath: this.configStore.getConfigPath(),
+      trusted,
+      runtimeStatus,
+      provider: {
+        activeProvider,
+        displayName: providerMeta.displayName,
+        sourceLabel: this.describeConfigValueSource(diagnostics.activeProviderSource),
+        runtimeSourceLabel: this.summarizeProviderConfigSource(providerSources),
+      },
+      projectContext: {
+        enabled: config.projectContextEnabled,
+        sourceLabel: this.describeConfigValueSource(diagnostics.projectContextEnabledSource),
+      },
+      apiKey: {
+        configured: apiKeyConfigured,
+        sourceLabel: this.describeConfigValueSource(providerSources.apiKey),
+      },
+      model: {
+        value: modelValue,
+        sourceLabel: this.describeConfigValueSource(providerSources.model),
+      },
+      endpoint: {
+        value: endpointValue,
+        sourceLabel: this.describeConfigValueSource(providerSources.baseUrl),
+      },
+      envFiles: {
+        loaded: diagnostics.loadedEnvFiles.length > 0,
+        label: diagnostics.loadedEnvFiles.length > 0 ? diagnostics.loadedEnvFiles.join(', ') : 'none loaded',
+        paths: diagnostics.loadedEnvFiles,
+      },
+      sessionOverrides: this.getSessionOverrideLabels(providerSources),
+      git: gitSummary,
+      project: projectSummary,
+    };
+  }
+
+  private async collectPromptScanExportData(): Promise<PromptScanExportData> {
+    const { mode, warning, result, anatomyView } = await this.withTimeout(
+      async () => {
+        const tokenization = await this.resolvePromptScanTokenizationStrategy();
+        const promptResult = await this.promptAssetScanner.scan(process.cwd(), {
+          tokenCounter: (text, _filePath) => tokenization.countTokens(text),
+        });
+        const promptAnatomyView = await this.buildContextAnatomyView(promptResult.files, tokenization.countTokens);
+        return {
+          mode: tokenization.getMode(),
+          warning: tokenization.getWarning(),
+          result: promptResult,
+          anatomyView: promptAnatomyView,
+        };
+      },
+      CommandHandler.SCAN_PROMPT_TIMEOUT_MS,
+      `/scan_prompt timed out after ${this.formatTimeoutMs(CommandHandler.SCAN_PROMPT_TIMEOUT_MS)}.`
+    );
+
+    const modeLabel =
+      mode === 'count_tokens'
+        ? 'messages/count_tokens'
+        : mode === 'messages_usage'
+          ? 'messages usage.input_tokens'
+          : 'local estimated tokens';
+
+    return {
+      scopeLabel: 'current_project',
+      tokenizerModeLabel: modeLabel,
+      tokenizerWarning: warning,
+      result,
+      anatomyView,
+    };
+  }
+
+  private async collectTokenScanExportData(source: TokenScanSource): Promise<TokenScanExportData> {
+    const target = await this.resolveTokenScanTarget({
+      source,
+      scope: 'current',
+      explicitSource: true,
+    });
+
+    return {
+      target,
+      summary:
+        target.filePaths.length > 0
+          ? await this.buildTokenStructureSummary(target.filePaths, target.source)
+          : this.createEmptyTokenStructureSummary(),
+    };
+  }
+
+  private createEmptyTokenStructureSummary(): TokenStructureSummary {
+    return {
+      files: [],
+      totalFiles: 0,
+      totalLines: 0,
+      parsedLines: 0,
+      invalidLines: 0,
+      recordsWithTokens: 0,
+      totalTokens: 0,
+      tokenFields: [],
+      roleBreakdown: [],
+      typeBreakdown: [],
+      dayBreakdown: [],
+    };
+  }
+
+  private async collectContextHealthExportData(source: TokenScanSource): Promise<ContextHealthExportData> {
+    const target = await this.resolveTokenScanTarget({
+      source,
+      scope: 'current',
+      explicitSource: true,
+    });
+
+    const records =
+      target.filePaths.length > 0
+        ? await this.findRecentContextUsageRecords(
+            target.filePaths,
+            CommandHandler.CONTEXT_HEALTH_RECENT_RECORDS,
+            target.source
+          )
+        : [];
+
+    return {
+      target,
+      records,
+      snapshot: records.length > 0 ? this.buildContextHealthSnapshot(records) : null,
+    };
+  }
+
+  private async collectNoiseEvaluationExportData(source: TokenScanSource): Promise<NoiseEvaluationExportData> {
+    const target = await this.resolveTokenScanTarget({
+      source,
+      scope: 'current',
+      explicitSource: true,
+    });
+
+    if (target.filePaths.length === 0) {
+      return {
+        target,
+        report: null,
+      };
+    }
+
+    return {
+      target,
+      report: await this.noiseEvaluator.analyze(
+        target.filePaths.map((filePath) => ({
+          sessionId: path.basename(filePath, path.extname(filePath)),
+          filePath,
+          source: target.source,
+        })),
+        {
+          workspaceHint: path.resolve(process.cwd()),
+        }
+      ),
+    };
+  }
+
+  private async collectTodoGranularityExportData(source: TokenScanSource): Promise<TodoGranularityExportData> {
+    const target = await this.resolveTokenScanTarget({
+      source,
+      scope: 'current',
+      explicitSource: true,
+    });
+
+    if (target.filePaths.length === 0) {
+      return {
+        target,
+        analysis: null,
+      };
+    }
+
+    const todosRoot = target.source === 'claude' ? await this.resolveClaudeDataDirectory('todos') : null;
+    const analyzer = new TodoGranularityAnalyzer({ todosRoot });
+
+    return {
+      target,
+      analysis: await analyzer.analyze(
+        target.filePaths.map((filePath) => ({
+          sessionId: path.basename(filePath, path.extname(filePath)),
+          filePath,
+          source: target.source,
+        }))
+      ),
+    };
+  }
+
+  private async writeExportDocument(
+    document: ExportDocument,
+    source: TokenScanSource,
+    selection: ExportSelection,
+    format: ExportFormat
+  ): Promise<string> {
+    const exportDir = path.join(process.cwd(), '.odradek', 'exports');
+    await fs.mkdir(exportDir, { recursive: true });
+
+    const timestamp = this.buildExportTimestamp(new Date());
+    const selectionLabel = selection === 'all' ? 'all' : selection;
+    const fileName = `odradek-export-${source}-${selectionLabel}-${timestamp}.${format}`;
+    const outputPath = path.join(exportDir, fileName);
+    await fs.writeFile(outputPath, `${JSON.stringify(document, null, 2)}\n`, 'utf8');
+    return outputPath;
+  }
+
+  private buildExportTimestamp(value: Date): string {
+    const year = String(value.getFullYear());
+    const month = String(value.getMonth() + 1).padStart(2, '0');
+    const day = String(value.getDate()).padStart(2, '0');
+    const hour = String(value.getHours()).padStart(2, '0');
+    const minute = String(value.getMinutes()).padStart(2, '0');
+    const second = String(value.getSeconds()).padStart(2, '0');
+    return `${year}${month}${day}-${hour}${minute}${second}`;
+  }
+
+  private async scanTokenStructures(args: string[]): Promise<void> {
+    const request = this.parseTokenScanRequest(args);
+    const spinner = process.stdout.isTTY ? new Spinner() : null;
+    if (spinner) {
+      spinner.start(`Parsing ${request.source} session JSONL token structures...`);
+    } else {
+      this.uiRenderer.renderInfo(`Parsing ${request.source} session JSONL token structures...`);
+    }
+
+    try {
       const target = await this.resolveTokenScanTarget(request);
       if (target.filePaths.length === 0) {
         if (spinner) {
@@ -659,7 +1665,7 @@ export class CommandHandler {
         return;
       }
 
-      const summary = await this.buildTokenStructureSummary(target.filePaths);
+      const summary = await this.buildTokenStructureSummary(target.filePaths, target.source);
       if (spinner) {
         spinner.stop('Token scan completed');
       } else {
@@ -697,15 +1703,15 @@ export class CommandHandler {
   }
 
   private async checkContextHealth(args: string[]): Promise<void> {
+    const request = this.parseTokenScanRequest(args);
     const spinner = process.stdout.isTTY ? new Spinner() : null;
     if (spinner) {
-      spinner.start('Evaluating context health...');
+      spinner.start(`Evaluating ${request.source} context health...`);
     } else {
-      this.uiRenderer.renderInfo('Evaluating context health...');
+      this.uiRenderer.renderInfo(`Evaluating ${request.source} context health...`);
     }
 
     try {
-      const request = this.parseTokenScanRequest(args);
       const target = await this.resolveTokenScanTarget(request);
       if (target.filePaths.length === 0) {
         if (spinner) {
@@ -723,7 +1729,8 @@ export class CommandHandler {
 
       const recentRecords = await this.findRecentContextUsageRecords(
         target.filePaths,
-        CommandHandler.CONTEXT_HEALTH_RECENT_RECORDS
+        CommandHandler.CONTEXT_HEALTH_RECENT_RECORDS,
+        target.source
       );
       if (recentRecords.length === 0) {
         if (spinner) {
@@ -756,7 +1763,8 @@ export class CommandHandler {
         'context_health',
         [
           `scope=${target.scopeLabel}`,
-          `source=${snapshot.source}`,
+          `selectedSource=${target.source}`,
+          `usageSource=${snapshot.source}`,
           `level=${snapshot.level}`,
           `confidence=${snapshot.confidence}`,
           `samples=${snapshot.dataPoints}`,
@@ -791,15 +1799,15 @@ export class CommandHandler {
   }
 
   private async analyzeContextNoise(args: string[]): Promise<void> {
+    const request = this.parseTokenScanRequest(args);
     const spinner = process.stdout.isTTY ? new Spinner() : null;
     if (spinner) {
-      spinner.start('Running formal noise evaluation from Claude sessions...');
+      spinner.start(`Running formal noise evaluation from ${request.source} sessions...`);
     } else {
-      this.uiRenderer.renderInfo('Running formal noise evaluation from Claude sessions...');
+      this.uiRenderer.renderInfo(`Running formal noise evaluation from ${request.source} sessions...`);
     }
 
     try {
-      const request = this.parseTokenScanRequest(args);
       const target = await this.resolveTokenScanTarget(request);
       if (target.filePaths.length === 0) {
         if (spinner) {
@@ -807,7 +1815,7 @@ export class CommandHandler {
         } else {
           this.uiRenderer.renderSuccess('Noise evaluation completed');
         }
-        this.uiRenderer.renderWarning('No Claude session JSONL files found for noise evaluation');
+        this.uiRenderer.renderWarning(`No ${target.source} session JSONL files found for noise evaluation`);
         this.recordCommandData(
           'noise_eval',
           [`scope=${target.scopeLabel}`, `source=${target.sourceLabel}`, 'jsonlFiles=0'].join('\n')
@@ -819,6 +1827,7 @@ export class CommandHandler {
         target.filePaths.map((filePath) => ({
           sessionId: path.basename(filePath, path.extname(filePath)),
           filePath,
+          source: target.source,
         })),
         {
           workspaceHint: request.scope === 'current' ? path.resolve(process.cwd()) : undefined,
@@ -866,6 +1875,7 @@ export class CommandHandler {
         createElement(NoiseEvaluationScreen, {
           scopeLabel: target.scopeLabel,
           sourceLabel: target.sourceLabel,
+          selectedSource: target.source,
           report,
         })
       );
@@ -877,6 +1887,7 @@ export class CommandHandler {
 
   private renderNoiseEvaluationFallback(target: TokenScanTarget, report: NoiseEvaluationReport): void {
     const metaLines: string[] = [
+      `Command: /noise_eval ${target.source}`,
       `Scope: ${target.scopeLabel} (${target.sourceLabel})`,
       `Coverage grade: ${this.renderCoverageGrade(report.coverageGrade)}`,
       `Workspace root: ${report.workspaceRoot || 'n/a'}`,
@@ -922,21 +1933,27 @@ export class CommandHandler {
     }
 
     if (report.git && report.git.files.length > 0) {
+      const attributedDiffFiles = report.git.files.filter((file) => file.attributed === true);
+      const hiddenDiffFiles = report.git.files.length - attributedDiffFiles.length;
       console.log('');
       console.log(chalk.bold('  Current Diff'));
-      report.git.files.slice(0, 8).forEach((file) => {
-        const status = this.colorizeNoiseStatus(
-          file.attributed === false || file.generatedLike ? 'watch' : 'ok',
-          file.status
-        );
-        const lineText =
-          file.addedLines === null && file.deletedLines === null
-            ? 'n/a'
-            : `+${file.addedLines ?? 0} -${file.deletedLines ?? 0}`;
-        const attribution =
-          file.attributed === true ? chalk.green('attributed') : file.attributed === false ? chalk.yellow('unattributed') : chalk.dim('n/a');
-        console.log(`  ${status.padEnd?.(10, ' ') ?? status} ${this.truncateBlockName(file.path, 54).padEnd(54, ' ')} ${lineText.padStart(12, ' ')}  ${attribution}`);
-      });
+      if (attributedDiffFiles.length === 0) {
+        console.log(chalk.dim('  - No agent-attributed diff files were found in the current working tree.'));
+      } else {
+        attributedDiffFiles.slice(0, 8).forEach((file) => {
+          const status = this.colorizeNoiseStatus(file.generatedLike ? 'watch' : 'ok', file.status);
+          const lineText =
+            file.addedLines === null && file.deletedLines === null
+              ? 'n/a'
+              : `+${file.addedLines ?? 0} -${file.deletedLines ?? 0}`;
+          console.log(
+            `  ${status.padEnd?.(10, ' ') ?? status} ${this.truncateBlockName(file.path, 54).padEnd(54, ' ')} ${lineText.padStart(12, ' ')}`
+          );
+        });
+      }
+      if (hiddenDiffFiles > 0) {
+        console.log(chalk.dim(`  - ${hiddenDiffFiles} non-attributed file(s) hidden from Current Diff.`));
+      }
     }
 
     if (report.fileHotspots.length > 0) {
@@ -1044,15 +2061,15 @@ export class CommandHandler {
   }
 
   private async analyzeTodoGranularity(args: string[]): Promise<void> {
+    const request = this.parseTokenScanRequest(args);
     const spinner = process.stdout.isTTY ? new Spinner() : null;
     if (spinner) {
-      spinner.start('Analyzing todo granularity against context usage...');
+      spinner.start(`Analyzing ${request.source} todo granularity against context usage...`);
     } else {
-      this.uiRenderer.renderInfo('Analyzing todo granularity against context usage...');
+      this.uiRenderer.renderInfo(`Analyzing ${request.source} todo granularity against context usage...`);
     }
 
     try {
-      const request = this.parseTokenScanRequest(args);
       const target = await this.resolveTokenScanTarget(request);
       if (target.filePaths.length === 0) {
         if (spinner) {
@@ -1060,7 +2077,7 @@ export class CommandHandler {
         } else {
           this.uiRenderer.renderSuccess('Todo granularity analysis completed');
         }
-        this.uiRenderer.renderWarning('No Claude session JSONL files found for todo analysis');
+        this.uiRenderer.renderWarning(`No ${target.source} session JSONL files found for todo analysis`);
         this.recordCommandData(
           'todo_granularity',
           [`scope=${target.scopeLabel}`, `source=${target.sourceLabel}`, 'jsonlFiles=0'].join('\n')
@@ -1068,12 +2085,13 @@ export class CommandHandler {
         return;
       }
 
-      const todosRoot = await this.resolveClaudeDataDirectory('todos');
+      const todosRoot = target.source === 'claude' ? await this.resolveClaudeDataDirectory('todos') : null;
       const analyzer = new TodoGranularityAnalyzer({ todosRoot });
       const analysis = await analyzer.analyze(
         target.filePaths.map((filePath) => ({
           sessionId: path.basename(filePath, path.extname(filePath)),
           filePath,
+          source: target.source,
         }))
       );
 
@@ -1117,6 +2135,7 @@ export class CommandHandler {
         createElement(TodoGranularityScreen, {
           scopeLabel: target.scopeLabel,
           sourceLabel: target.sourceLabel,
+          selectedSource: target.source,
           analysis,
         })
       );
@@ -1128,12 +2147,13 @@ export class CommandHandler {
 
   private renderTodoGranularityAnalysisFallback(target: TokenScanTarget, analysis: TodoGranularityAnalysis): void {
     const headerLines = [
+      `Command: /todo_granularity ${target.source}`,
       `Scope: ${target.scopeLabel}`,
       `Source: ${target.sourceLabel}`,
       `Sessions scanned: ${analysis.sessionsScanned}`,
       `Sessions with todos: ${analysis.sessionsWithTodos}`,
       `Todo files found: ${analysis.todoFilesFound}`,
-      `Snapshot fallback sessions: ${analysis.sessionsUsingSnapshotFallback}`,
+      `Fallback sessions: ${analysis.sessionsUsingSnapshotFallback}`,
       `Todos analyzed: ${analysis.items.length}`,
       `Todos with context usage: ${analysis.todosWithContext}`,
     ];
@@ -1257,7 +2277,11 @@ export class CommandHandler {
     );
   }
 
-  private async findRecentContextUsageRecords(filePaths: string[], maxRecords: number): Promise<ContextUsageRecord[]> {
+  private async findRecentContextUsageRecords(
+    filePaths: string[],
+    maxRecords: number,
+    source: TokenScanSource
+  ): Promise<ContextUsageRecord[]> {
     if (maxRecords <= 0) {
       return [];
     }
@@ -1275,6 +2299,7 @@ export class CommandHandler {
       }
 
       const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
+      const codexDefaults = source === 'codex' ? this.readCodexUsageDefaults(lines) : null;
       let perFileCount = 0;
       for (let i = lines.length - 1; i >= 0; i -= 1) {
         if (perFileCount >= CommandHandler.CONTEXT_HEALTH_MAX_RECORDS_PER_FILE) {
@@ -1288,7 +2313,7 @@ export class CommandHandler {
           continue;
         }
 
-        const candidate = this.extractContextUsageRecord(parsed, filePath, fileTimestampMs);
+        const candidate = this.extractContextUsageRecord(parsed, filePath, fileTimestampMs, source, codexDefaults);
         if (!candidate) {
           continue;
         }
@@ -1303,9 +2328,74 @@ export class CommandHandler {
       .slice(0, maxRecords);
   }
 
-  private extractContextUsageRecord(payload: unknown, filePath: string, fileTimestampMs: number): ContextUsageRecord | null {
+  private readCodexUsageDefaults(lines: string[]): { model: string; contextWindowTokens: number | null } {
+    let model = 'unknown';
+    let contextWindowTokens: number | null = null;
+
+    for (const line of lines.slice(0, 80)) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line) as unknown;
+      } catch {
+        continue;
+      }
+
+      model = this.getStringAtPaths(parsed, [['payload', 'model'], ['payload', 'model_name']]) ?? model;
+      contextWindowTokens =
+        this.getNumberAtPaths(parsed, [['payload', 'model_context_window'], ['payload', 'info', 'model_context_window']]) ??
+        contextWindowTokens;
+    }
+
+    return { model, contextWindowTokens };
+  }
+
+  private extractContextUsageRecord(
+    payload: unknown,
+    filePath: string,
+    fileTimestampMs: number,
+    source: TokenScanSource,
+    defaults?: { model: string; contextWindowTokens: number | null } | null
+  ): ContextUsageRecord | null {
     if (!payload || typeof payload !== 'object') {
       return null;
+    }
+
+    if (source === 'codex') {
+      const topType = this.getStringAtPaths(payload, [['type']])?.toLowerCase() ?? '';
+      const payloadType = this.getStringAtPaths(payload, [['payload', 'type']])?.toLowerCase() ?? '';
+      if (topType !== 'event_msg' || payloadType !== 'token_count') {
+        return null;
+      }
+
+      const usageObject = this.getObjectAtPath(payload, ['payload', 'info', 'last_token_usage']);
+      if (!usageObject) {
+        return null;
+      }
+
+      const inputTokens = this.getNumberAtPaths(usageObject, [['input_tokens']]) ?? 0;
+      const cacheReadTokens =
+        this.getNumberAtPaths(usageObject, [['cached_input_tokens'], ['cache_read_input_tokens'], ['cacheReadInputTokens']]) ?? 0;
+      const contextWindowTokens =
+        this.getNumberAtPaths(payload, [['payload', 'info', 'model_context_window'], ['payload', 'model_context_window']]) ??
+        defaults?.contextWindowTokens ??
+        null;
+      const hasUsage = inputTokens > 0 || cacheReadTokens > 0;
+      if (!hasUsage && contextWindowTokens === null) {
+        return null;
+      }
+
+      const timestampMs = this.extractTokenTimestampMs(payload) || fileTimestampMs;
+      return {
+        timestampMs,
+        timestampLabel: timestampMs > 0 ? new Date(timestampMs).toLocaleString() : 'unknown',
+        filePath,
+        model: defaults?.model ?? 'unknown',
+        contextUsedPercent: null,
+        contextWindowTokens: contextWindowTokens === null ? null : Math.max(1, Math.round(contextWindowTokens)),
+        inputTokens,
+        cacheCreationTokens: 0,
+        cacheReadTokens,
+      };
     }
 
     const usageObject =
@@ -1599,6 +2689,7 @@ export class CommandHandler {
         createElement(ContextHealthScreen, {
           scopeLabel: target.scopeLabel,
           sourceLabel: target.sourceLabel,
+          selectedSource: target.source,
           snapshot,
         })
       );
@@ -1653,6 +2744,7 @@ export class CommandHandler {
         : chalk.dim('0.0% vs previous');
 
     const lines: string[] = [
+      `Command: /context_health ${target.source}`,
       `Scope: ${target.scopeLabel}`,
       `Status: ${levelText} (${snapshot.levelReason})`,
       `Confidence: ${confidenceText} (${snapshot.confidenceReason})`,
@@ -2297,25 +3389,30 @@ export class CommandHandler {
 
   private parseTokenScanRequest(args: string[]): TokenScanRequest {
     if (args.length === 0) {
-      return { scope: 'current' };
+      return { source: 'claude', scope: 'current' };
     }
 
-    const normalized = args[0]?.trim().toLowerCase();
-    if (normalized === 'current') {
-      return { scope: 'current' };
+    const first = args[0]?.trim().toLowerCase();
+    const explicitSource = first === 'claude' || first === 'codex';
+    const source: TokenScanSource = explicitSource ? (first as TokenScanSource) : 'claude';
+    const rest = explicitSource ? args.slice(1) : args;
+    const normalized = rest[0]?.trim().toLowerCase();
+
+    if (rest.length === 0 || normalized === 'current') {
+      return { source, scope: 'current', explicitSource };
     }
     if (normalized === 'all') {
-      return { scope: 'all' };
+      return { source, scope: 'all', explicitSource };
     }
 
-    return { scope: 'path', rawPath: args.join(' ').trim() };
+    return { source, scope: 'path', rawPath: rest.join(' ').trim(), explicitSource };
   }
 
   private async resolveTokenScanTarget(request: TokenScanRequest): Promise<TokenScanTarget> {
     if (request.scope === 'path') {
       const inputPath = request.rawPath?.trim();
       if (!inputPath) {
-        throw new Error('Missing path. Usage: /scan_tokens [current|all|path]');
+        throw new Error('Missing path. Usage: /scan_tokens [claude|codex] [current|all|path]');
       }
 
       const expandedPath = this.expandHomePath(inputPath);
@@ -2331,7 +3428,9 @@ export class CommandHandler {
         if (!resolvedPath.toLowerCase().endsWith('.jsonl')) {
           throw new Error(`File is not JSONL: ${resolvedPath}`);
         }
+        const detectedSource = await this.detectTranscriptSourceFromPath(resolvedPath, request.source);
         return {
+          source: detectedSource,
           scopeLabel: 'explicit_path',
           sourceLabel: resolvedPath,
           projectDirs: [path.dirname(resolvedPath)],
@@ -2343,8 +3442,13 @@ export class CommandHandler {
         throw new Error(`Path is neither a file nor directory: ${resolvedPath}`);
       }
 
-      const filePaths = await this.listRecentJsonlFiles(resolvedPath, CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL);
+      const detectedSource = await this.detectTranscriptSourceFromPath(resolvedPath, request.source);
+      const filePaths =
+        detectedSource === 'codex'
+          ? await this.listRecentCodexRolloutFiles(resolvedPath, CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL)
+          : await this.listRecentJsonlFiles(resolvedPath, CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL);
       return {
+        source: detectedSource,
         scopeLabel: 'explicit_path',
         sourceLabel: resolvedPath,
         projectDirs: [resolvedPath],
@@ -2352,51 +3456,9 @@ export class CommandHandler {
       };
     }
 
-    const projectsRoot = await this.resolveClaudeDataDirectory('projects');
-    if (!projectsRoot || !(await this.pathExists(projectsRoot))) {
-      return {
-        scopeLabel: request.scope === 'all' ? 'all_projects' : 'current_project',
-        sourceLabel: projectsRoot ?? path.join(os.homedir(), '.claude', 'projects'),
-        projectDirs: [],
-        filePaths: [],
-      };
-    }
-
-    const projectDirs =
-      request.scope === 'all'
-        ? await this.listClaudeProjectDirectories(projectsRoot)
-        : await this.resolveClaudeProjectDirectories(projectsRoot, process.cwd());
-
-    const uniqueFiles = new Set<string>();
-    const filePaths: string[] = [];
-    const perProjectLimit =
-      request.scope === 'all'
-        ? CommandHandler.MAX_TOKEN_SCAN_FILES_PER_PROJECT_ALL
-        : CommandHandler.MAX_TOKEN_SCAN_FILES_PER_PROJECT;
-
-    for (const projectDir of projectDirs) {
-      const files = await this.listRecentJsonlFiles(projectDir, perProjectLimit);
-      for (const filePath of files) {
-        if (uniqueFiles.has(filePath)) {
-          continue;
-        }
-        uniqueFiles.add(filePath);
-        filePaths.push(filePath);
-        if (filePaths.length >= CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL) {
-          break;
-        }
-      }
-      if (filePaths.length >= CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL) {
-        break;
-      }
-    }
-
-    return {
-      scopeLabel: request.scope === 'all' ? 'all_projects' : 'current_project',
-      sourceLabel: request.scope === 'all' ? projectsRoot : path.resolve(process.cwd()),
-      projectDirs,
-      filePaths,
-    };
+    return request.source === 'codex'
+      ? this.resolveCodexTokenScanTarget(request)
+      : this.resolveClaudeTokenScanTarget(request);
   }
 
   private expandHomePath(inputPath: string): string {
@@ -2411,6 +3473,16 @@ export class CommandHandler {
 
   private async resolveClaudeDataDirectory(childName: 'projects' | 'todos'): Promise<string | null> {
     const candidates = this.buildClaudeDataDirectoryCandidates(childName);
+    for (const candidate of candidates) {
+      if (await this.pathExists(candidate)) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  private async resolveCodexDataDirectory(childName: 'sessions' | 'archived_sessions'): Promise<string | null> {
+    const candidates = this.buildCodexDataDirectoryCandidates(childName);
     for (const candidate of candidates) {
       if (await this.pathExists(candidate)) {
         return candidate;
@@ -2448,6 +3520,35 @@ export class CommandHandler {
     return Array.from(candidates);
   }
 
+  private buildCodexDataDirectoryCandidates(childName: 'sessions' | 'archived_sessions'): string[] {
+    const candidates = new Set<string>();
+    const addCandidate = (basePath: string | undefined | null): void => {
+      if (!basePath) {
+        return;
+      }
+      const trimmed = basePath.trim();
+      if (!trimmed) {
+        return;
+      }
+      candidates.add(path.resolve(trimmed, childName));
+    };
+
+    addCandidate(path.join(os.homedir(), '.codex'));
+    addCandidate(process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.codex') : null);
+    addCandidate(process.env.HOME ? path.join(process.env.HOME, '.codex') : null);
+
+    if (process.env.HOMEDRIVE && process.env.HOMEPATH) {
+      addCandidate(path.join(`${process.env.HOMEDRIVE}${process.env.HOMEPATH}`, '.codex'));
+    }
+
+    const cwdParts = path.resolve(process.cwd()).split(path.sep).filter((part) => part.length > 0);
+    if (cwdParts.length >= 3 && cwdParts[1]?.toLowerCase() === 'users') {
+      addCandidate(path.join(cwdParts[0] ?? '', 'Users', cwdParts[2] ?? '', '.codex'));
+    }
+
+    return Array.from(candidates);
+  }
+
   private async listClaudeProjectDirectories(projectsRoot: string): Promise<string[]> {
     try {
       const entries = await fs.readdir(projectsRoot, { withFileTypes: true });
@@ -2460,7 +3561,7 @@ export class CommandHandler {
     }
   }
 
-  private async buildTokenStructureSummary(filePaths: string[]): Promise<TokenStructureSummary> {
+  private async buildTokenStructureSummary(filePaths: string[], source: TokenScanSource): Promise<TokenStructureSummary> {
     const fieldMap = new Map<string, { total: number; count: number }>();
     const roleMap = new Map<string, { totalTokens: number; records: number }>();
     const typeMap = new Map<string, { totalTokens: number; records: number }>();
@@ -2474,7 +3575,7 @@ export class CommandHandler {
     let totalTokens = 0;
 
     for (const filePath of filePaths) {
-      const fileSummary = await this.analyzeTokenJsonlFile(filePath, fieldMap, roleMap, typeMap, dayMap);
+      const fileSummary = await this.analyzeTokenJsonlFile(filePath, source, fieldMap, roleMap, typeMap, dayMap);
       files.push(fileSummary);
       totalLines += fileSummary.totalLines;
       parsedLines += fileSummary.parsedLines;
@@ -2520,6 +3621,7 @@ export class CommandHandler {
 
   private async analyzeTokenJsonlFile(
     filePath: string,
+    source: TokenScanSource,
     fieldMap: Map<string, { total: number; count: number }>,
     roleMap: Map<string, { totalTokens: number; records: number }>,
     typeMap: Map<string, { totalTokens: number; records: number }>,
@@ -2565,7 +3667,7 @@ export class CommandHandler {
       }
 
       parsedLines += 1;
-      const lineSummary = this.summarizeTokenLine(parsed);
+      const lineSummary = this.summarizeTokenLine(parsed, source);
       totalTokens += lineSummary.totalTokens;
       if (lineSummary.totalTokens > 0) {
         recordsWithTokens += 1;
@@ -2614,7 +3716,7 @@ export class CommandHandler {
     };
   }
 
-  private summarizeTokenLine(payload: unknown): {
+  private summarizeTokenLine(payload: unknown, source: TokenScanSource): {
     fields: Array<{ name: string; value: number }>;
     totalTokens: number;
     role: string;
@@ -2622,10 +3724,18 @@ export class CommandHandler {
     timestampMs: number;
   } {
     const fields: Array<{ name: string; value: number }> = [];
-    this.extractTokenFieldsFromPayload(payload, '', fields);
-    const totalTokens = fields.reduce((sum, field) => sum + field.value, 0);
-    const role = this.extractTokenRoleFromPayload(payload);
-    const type = this.extractTokenTypeFromPayload(payload);
+    if (source === 'codex') {
+      this.extractCodexTokenFields(payload, fields);
+    } else {
+      this.extractTokenFieldsFromPayload(payload, '', fields);
+    }
+    const totalTokens =
+      source === 'codex'
+        ? fields.reduce((sum, field) => sum + (field.name.endsWith('.total_tokens') ? field.value : 0), 0) ||
+          fields.reduce((sum, field) => sum + field.value, 0)
+        : fields.reduce((sum, field) => sum + field.value, 0);
+    const role = this.extractTokenRoleFromPayload(payload, source);
+    const type = this.extractTokenTypeFromPayload(payload, source);
     const timestampMs = this.extractTokenTimestampMs(payload);
     return {
       fields,
@@ -2667,6 +3777,20 @@ export class CommandHandler {
     }
   }
 
+  private extractCodexTokenFields(payload: unknown, fields: Array<{ name: string; value: number }>): void {
+    const lastUsage = this.getObjectAtPath(payload, ['payload', 'info', 'last_token_usage']);
+    if (!lastUsage) {
+      return;
+    }
+
+    Object.entries(lastUsage).forEach(([key, value]) => {
+      const normalized = this.normalizeTokenValue(value);
+      if (normalized !== null && /token/i.test(key)) {
+        fields.push({ name: `payload.info.last_token_usage.${key}`, value: normalized });
+      }
+    });
+  }
+
   private isLikelyTokenKey(key: string): boolean {
     return /token/i.test(key);
   }
@@ -2692,12 +3816,20 @@ export class CommandHandler {
     return Math.max(0, parsed);
   }
 
-  private extractTokenRoleFromPayload(payload: unknown): string {
+  private extractTokenRoleFromPayload(payload: unknown, source: TokenScanSource): string {
     if (!payload || typeof payload !== 'object') {
       return 'unknown';
     }
 
     const record = payload as Record<string, unknown>;
+    if (source === 'codex') {
+      const payloadRole = this.getStringAtPaths(record, [['payload', 'role']])?.toLowerCase();
+      if (payloadRole === 'assistant' || payloadRole === 'user' || payloadRole === 'developer') {
+        return payloadRole;
+      }
+      return this.getStringAtPaths(record, [['type'], ['payload', 'type']])?.toLowerCase() ?? 'unknown';
+    }
+
     const message = record.message && typeof record.message === 'object' ? (record.message as Record<string, unknown>) : null;
     const candidates: unknown[] = [
       record.role,
@@ -2734,12 +3866,18 @@ export class CommandHandler {
     return 'unknown';
   }
 
-  private extractTokenTypeFromPayload(payload: unknown): string {
+  private extractTokenTypeFromPayload(payload: unknown, source: TokenScanSource): string {
     if (!payload || typeof payload !== 'object') {
       return 'unknown';
     }
 
     const record = payload as Record<string, unknown>;
+    if (source === 'codex') {
+      const topType = this.getStringAtPaths(record, [['type']])?.trim().toLowerCase() ?? '';
+      const payloadType = this.getStringAtPaths(record, [['payload', 'type']])?.trim().toLowerCase() ?? '';
+      return payloadType ? `${topType}:${payloadType}` : topType || 'unknown';
+    }
+
     const message = record.message && typeof record.message === 'object' ? (record.message as Record<string, unknown>) : null;
     const candidates: unknown[] = [record.type, message?.type, record.event, record.kind];
 
@@ -4374,6 +5512,216 @@ export class CommandHandler {
     }
   }
 
+  private async resolveClaudeTokenScanTarget(request: TokenScanRequest): Promise<TokenScanTarget> {
+    const projectsRoot = await this.resolveClaudeDataDirectory('projects');
+    if (!projectsRoot || !(await this.pathExists(projectsRoot))) {
+      return {
+        source: 'claude',
+        scopeLabel: request.scope === 'all' ? 'all_projects' : 'current_project',
+        sourceLabel: projectsRoot ?? path.join(os.homedir(), '.claude', 'projects'),
+        projectDirs: [],
+        filePaths: [],
+      };
+    }
+
+    const projectDirs =
+      request.scope === 'all'
+        ? await this.listClaudeProjectDirectories(projectsRoot)
+        : await this.resolveClaudeProjectDirectories(projectsRoot, process.cwd());
+
+    const uniqueFiles = new Set<string>();
+    const filePaths: string[] = [];
+    const perProjectLimit =
+      request.scope === 'all'
+        ? CommandHandler.MAX_TOKEN_SCAN_FILES_PER_PROJECT_ALL
+        : CommandHandler.MAX_TOKEN_SCAN_FILES_PER_PROJECT;
+
+    for (const projectDir of projectDirs) {
+      const files = await this.listRecentJsonlFiles(projectDir, perProjectLimit);
+      for (const filePath of files) {
+        if (uniqueFiles.has(filePath)) {
+          continue;
+        }
+        uniqueFiles.add(filePath);
+        filePaths.push(filePath);
+        if (filePaths.length >= CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL) {
+          break;
+        }
+      }
+      if (filePaths.length >= CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL) {
+        break;
+      }
+    }
+
+    return {
+      source: 'claude',
+      scopeLabel: request.scope === 'all' ? 'all_projects' : 'current_project',
+      sourceLabel: request.scope === 'all' ? projectsRoot : path.resolve(process.cwd()),
+      projectDirs,
+      filePaths,
+    };
+  }
+
+  private async resolveCodexTokenScanTarget(request: TokenScanRequest): Promise<TokenScanTarget> {
+    const sessionsRoot = await this.resolveCodexDataDirectory('sessions');
+    if (!sessionsRoot || !(await this.pathExists(sessionsRoot))) {
+      return {
+        source: 'codex',
+        scopeLabel: request.scope === 'all' ? 'all_sessions' : 'current_project',
+        sourceLabel: sessionsRoot ?? path.join(os.homedir(), '.codex', 'sessions'),
+        projectDirs: [],
+        filePaths: [],
+      };
+    }
+
+    const allFiles = await this.listRecentCodexRolloutFiles(sessionsRoot, CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL * 4);
+    const currentWorkspace = path.resolve(process.cwd());
+    const filePaths: string[] = [];
+    for (const filePath of allFiles) {
+      if (request.scope === 'current') {
+        const sessionCwd = await this.readCodexSessionCwd(filePath);
+        if (!sessionCwd || !this.pathsAreRelated(sessionCwd, currentWorkspace)) {
+          continue;
+        }
+      }
+      filePaths.push(filePath);
+      if (filePaths.length >= CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL) {
+        break;
+      }
+    }
+
+    return {
+      source: 'codex',
+      scopeLabel: request.scope === 'all' ? 'all_sessions' : 'current_project',
+      sourceLabel: request.scope === 'all' ? sessionsRoot : currentWorkspace,
+      projectDirs: request.scope === 'all' ? [sessionsRoot] : [currentWorkspace],
+      filePaths,
+    };
+  }
+
+  private async listRecentCodexRolloutFiles(rootPath: string, limit: number): Promise<string[]> {
+    const queue = [rootPath];
+    const files: Array<{ fullPath: string; mtimeMs: number }> = [];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current) {
+        continue;
+      }
+
+      let entries: Array<{ isDirectory(): boolean; isFile(): boolean; name: string }> = [];
+      try {
+        entries = await fs.readdir(current, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+
+      for (const entry of entries) {
+        const fullPath = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          queue.push(fullPath);
+          continue;
+        }
+        if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.jsonl')) {
+          continue;
+        }
+        if (!/^rollout-.*\.jsonl$/i.test(entry.name)) {
+          continue;
+        }
+        try {
+          const stat = await fs.stat(fullPath);
+          files.push({ fullPath, mtimeMs: stat.mtimeMs });
+        } catch {
+          continue;
+        }
+      }
+    }
+
+    return files
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .slice(0, Math.max(1, limit))
+      .map((item) => item.fullPath);
+  }
+
+  private async readCodexSessionCwd(filePath: string): Promise<string> {
+    let raw = '';
+    try {
+      raw = await fs.readFile(filePath, 'utf8');
+    } catch {
+      return '';
+    }
+
+    const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0).slice(0, 80);
+    for (const line of lines) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line) as unknown;
+      } catch {
+        continue;
+      }
+      const cwd = this.getStringAtPaths(parsed, [['payload', 'cwd']]) ?? this.getStringAtPaths(parsed, [['cwd']]);
+      if (cwd) {
+        return path.resolve(cwd);
+      }
+    }
+    return '';
+  }
+
+  private async detectTranscriptSourceFromPath(inputPath: string, fallback: TokenScanSource): Promise<TokenScanSource> {
+    const normalizedPath = inputPath.replace(/\\/g, '/').toLowerCase();
+    if (normalizedPath.includes('/.codex/sessions/') || normalizedPath.includes('/.codex/archived_sessions/')) {
+      return 'codex';
+    }
+    if (normalizedPath.includes('/.claude/')) {
+      return 'claude';
+    }
+
+    let stat;
+    try {
+      stat = await fs.stat(inputPath);
+    } catch {
+      return fallback;
+    }
+
+    const probeFile = stat.isFile()
+      ? inputPath
+      : (await this.listRecentCodexRolloutFiles(inputPath, 1))[0] ?? (await this.listRecentJsonlFiles(inputPath, 1))[0];
+    if (!probeFile) {
+      return fallback;
+    }
+
+    let raw = '';
+    try {
+      raw = await fs.readFile(probeFile, 'utf8');
+    } catch {
+      return fallback;
+    }
+
+    const firstLine = raw.split(/\r?\n/).find((line) => line.trim().length > 0);
+    if (!firstLine) {
+      return fallback;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(firstLine) as unknown;
+    } catch {
+      return fallback;
+    }
+
+    const topType = this.getStringAtPaths(parsed, [['type']])?.toLowerCase() ?? '';
+    return topType === 'session_meta' || topType === 'turn_context' || topType === 'response_item' || topType === 'event_msg'
+      ? 'codex'
+      : fallback;
+  }
+
+  private pathsAreRelated(leftPath: string, rightPath: string): boolean {
+    const left = path.resolve(leftPath).toLowerCase();
+    const right = path.resolve(rightPath).toLowerCase();
+    const sep = path.sep.toLowerCase();
+    return left === right || left.startsWith(`${right}${sep}`) || right.startsWith(`${left}${sep}`);
+  }
+
   private findClaudeProjectExactMatches(
     projectsRoot: string,
     projectEntries: Array<{ name: string }>,
@@ -4719,17 +6067,8 @@ export class CommandHandler {
     }
   }
 
-  private formatPathForState(value: string, maxLength = 72): string {
-    const home = os.homedir().replace(/\\/g, '/');
-    const normalized = value.replace(/\\/g, '/');
-    const display = normalized.startsWith(home) ? `~${normalized.slice(home.length)}` : normalized;
-    if (display.length <= maxLength) {
-      return display;
-    }
-
-    const headLength = Math.max(12, Math.floor((maxLength - 3) / 2));
-    const tailLength = Math.max(12, maxLength - headLength - 3);
-    return `${display.slice(0, headLength)}...${display.slice(-tailLength)}`;
+  private formatPathForState(value: string): string {
+    return path.resolve(value);
   }
 
   private summarizeProviderConfigSource(sources: ProviderConfigSources): string {

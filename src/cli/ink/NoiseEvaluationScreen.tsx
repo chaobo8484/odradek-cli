@@ -1,5 +1,6 @@
 import path from 'path';
 import { Box, Text } from 'ink';
+import type { ReactNode } from 'react';
 import type {
   GitDiffFile,
   NoiseCoverageRow,
@@ -12,6 +13,7 @@ import type {
 type NoiseEvaluationScreenProps = {
   scopeLabel: string;
   sourceLabel: string;
+  selectedSource: 'claude' | 'codex';
   report: NoiseEvaluationReport;
 };
 
@@ -29,6 +31,8 @@ type HighlightItem = {
   severity: Extract<NoiseMetricStatus, 'watch' | 'high'>;
   message: string;
 };
+
+type Tone = 'white' | 'gray' | 'green' | 'yellow' | 'red' | 'cyan' | 'blue';
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat('en-US').format(Math.round(value));
@@ -113,6 +117,61 @@ function chunk<T>(items: T[], size: number): T[][] {
     rows.push(items.slice(index, index + size));
   }
   return rows;
+}
+
+function buildSectionBorder(
+  title: string,
+  width: number,
+  note?: string
+): {
+  titleText: string;
+  noteText: string;
+  fill: string;
+  bottom: string;
+} {
+  const titleText = title.toUpperCase();
+  const noteText = note ? truncateMiddle(note, Math.max(12, Math.floor(width * 0.26))) : '';
+  const reservedWidth = 4 + titleText.length + (noteText ? noteText.length + 1 : 0);
+  const fill = '─'.repeat(Math.max(1, width - reservedWidth));
+  return {
+    titleText,
+    noteText,
+    fill,
+    bottom: `└${'─'.repeat(Math.max(1, width - 1))}`,
+  };
+}
+
+function SectionBlock({
+  title,
+  width,
+  note,
+  tone = 'gray',
+  children,
+  marginBottom = 1,
+}: {
+  title: string;
+  width: number;
+  note?: string;
+  tone?: Tone;
+  children: ReactNode;
+  marginBottom?: number;
+}) {
+  const border = buildSectionBorder(title, width, note);
+
+  return (
+    <Box flexDirection="column" marginBottom={marginBottom}>
+      <Box>
+        <Text color="gray">┌─ </Text>
+        <Text color={tone}>{border.titleText}</Text>
+        <Text color="gray"> {border.fill}</Text>
+        {border.noteText ? <Text color="gray"> {border.noteText}</Text> : null}
+      </Box>
+      <Box flexDirection="column" paddingLeft={1}>
+        {children}
+      </Box>
+      <Text color="gray">{border.bottom}</Text>
+    </Box>
+  );
 }
 
 function buildMetricHeadline(metric: NoiseMetric): string {
@@ -307,20 +366,9 @@ function SummaryGridCell({ stat, width }: { stat: SummaryStat; width: number }) 
   );
 }
 
-function SummaryHero({ grade, signals }: { grade: SummaryStat; signals: SummaryStat }) {
+function SummaryHero({ grade, signals, width }: { grade: SummaryStat; signals: SummaryStat; width: number }) {
   return (
-    <Box
-      flexDirection="column"
-      borderStyle="round"
-      borderColor={grade.accentColor}
-      paddingX={1}
-      paddingY={0}
-      marginBottom={1}
-    >
-      <Box justifyContent="space-between">
-        <Text color="gray">SUMMARY</Text>
-        <Text color="gray">{grade.note ?? 'workspace n/a'}</Text>
-      </Box>
+    <SectionBlock title="Summary" width={width} note={grade.note ?? 'workspace n/a'} tone={grade.accentColor as Tone}>
       <Box>
         <Text color={grade.accentColor}>GRADE {grade.value}</Text>
         <Text color="gray"> coverage grade</Text>
@@ -329,7 +377,7 @@ function SummaryHero({ grade, signals }: { grade: SummaryStat; signals: SummaryS
         <Text color={signals.accentColor}>signals {signals.value}</Text>
         <Text color="gray"> {signals.note ?? 'no active watch'}</Text>
       </Box>
-    </Box>
+    </SectionBlock>
   );
 }
 
@@ -347,7 +395,7 @@ function DimensionCard({ dimension, width }: { dimension: NoiseDimensionReport; 
     <Box
       width={width}
       flexDirection="column"
-      borderStyle="round"
+      borderStyle="single"
       borderColor="gray"
       paddingX={1}
       paddingY={0}
@@ -379,7 +427,7 @@ function DimensionCard({ dimension, width }: { dimension: NoiseDimensionReport; 
   );
 }
 
-export function NoiseEvaluationScreen({ scopeLabel, sourceLabel, report }: NoiseEvaluationScreenProps) {
+export function NoiseEvaluationScreen({ scopeLabel, sourceLabel, selectedSource, report }: NoiseEvaluationScreenProps) {
   const terminalWidth = process.stdout.columns ?? 120;
   const contentWidth = Math.max(64, terminalWidth - 2);
   const dimensionColumns = terminalWidth >= 120 ? 2 : 1;
@@ -389,20 +437,23 @@ export function NoiseEvaluationScreen({ scopeLabel, sourceLabel, report }: Noise
   const gradeStat = summaryStats.find((stat) => stat.key === 'grade') ?? summaryStats[0];
   const signalsStat = summaryStats.find((stat) => stat.key === 'signals') ?? summaryStats[0];
   const secondaryStats = summaryStats.filter((stat) => stat.key !== 'grade');
-  const diffFiles = report.git?.files.slice(0, 8) ?? [];
+  const attributedDiffFiles = report.git?.files.filter((file) => file.attributed === true) ?? [];
+  const diffFiles = attributedDiffFiles.slice(0, 8);
+  const hiddenDiffFileCount = Math.max(0, (report.git?.files.length ?? 0) - attributedDiffFiles.length);
   const diffPathWidth = Math.max(26, contentWidth - 34);
   const scopeLine = `scope ${scopeLabel} | source ${truncateMiddle(sourceLabel, 40)}`;
   const summaryColumns = terminalWidth >= 120 ? 3 : terminalWidth >= 92 ? 2 : 1;
   const summaryCellWidth = Math.max(18, Math.floor((contentWidth - (summaryColumns - 1) * 2) / summaryColumns));
+  const commandLine = `/noise_eval ${selectedSource}`;
 
   return (
     <Box flexDirection="column" paddingX={1}>
       <Box justifyContent="space-between">
-        <Text color="white">/noise_eval</Text>
+        <Text color="white">{commandLine}</Text>
         <Text color="gray">odradek - noise eval</Text>
       </Box>
       <Text color="gray">{scopeLine}</Text>
-      <SummaryHero grade={gradeStat} signals={signalsStat} />
+      <SummaryHero grade={gradeStat} signals={signalsStat} width={contentWidth} />
       {chunk(secondaryStats, summaryColumns).map((row, rowIndex) => (
         <Box key={`summary-grid-${rowIndex}`}>
           {row.map((stat, index) => (
@@ -414,83 +465,64 @@ export function NoiseEvaluationScreen({ scopeLabel, sourceLabel, report }: Noise
       ))}
 
       {highlightItems.length > 0 ? (
-        <Box
-          flexDirection="column"
-          borderStyle="round"
-          borderColor="yellow"
-          paddingX={1}
-          paddingY={0}
-          marginBottom={1}
-        >
-          <Text color="yellow">WATCH - {highlightItems.length} item(s)</Text>
+        <SectionBlock title="Watch" width={contentWidth} note={`${highlightItems.length} item(s)`} tone="yellow">
           {highlightItems.map((item) => (
             <Text key={item.id} color={item.severity === 'high' ? 'red' : 'yellow'} wrap="wrap">
               [{item.tag}] {item.message}
             </Text>
           ))}
-        </Box>
+        </SectionBlock>
       ) : null}
 
       {report.nextActions.length > 0 ? (
-        <Box
-          flexDirection="column"
-          borderStyle="round"
-          borderColor="green"
-          paddingX={1}
-          paddingY={0}
-          marginBottom={1}
-        >
-          <Text color="green">Next Actions</Text>
+        <SectionBlock title="Next Actions" width={contentWidth} tone="green">
           {report.nextActions.slice(0, 4).map((action, index) => (
             <Text key={`action-${index}`} color="white" wrap="wrap">
               {index + 1}. {action}
             </Text>
           ))}
-        </Box>
+        </SectionBlock>
       ) : null}
 
-      <Box
-        flexDirection="column"
-        borderStyle="round"
-        borderColor="gray"
-        paddingX={1}
-        paddingY={0}
-        marginBottom={1}
-      >
-        <Text color="gray">EVIDENCE COVERAGE</Text>
+      <SectionBlock title="Evidence Coverage" width={contentWidth}>
         {report.coverage.map((row) => (
           <CoverageRowView key={row.dimension} row={row} />
         ))}
-        <Text color="gray">Feasible Scope</Text>
+        <Box marginTop={1} marginBottom={0}>
+          <Text color="gray">Feasible Scope</Text>
+        </Box>
         {report.feasibleScope.map((item, index) => (
           <Text key={`scope-${index}`} color="gray" wrap="wrap">
             {index + 1}. {item}
           </Text>
         ))}
-      </Box>
+      </SectionBlock>
 
-      <Text color="gray">DIMENSION METRICS</Text>
-      {chunk(report.dimensions, dimensionColumns).map((row, rowIndex) => (
-        <Box key={`dimensions-${rowIndex}`}>
-          {row.map((dimension, cardIndex) => (
-            <Box key={dimension.key} marginRight={cardIndex < row.length - 1 ? 1 : 0}>
-              <DimensionCard dimension={dimension} width={dimensionCardWidth} />
-            </Box>
-          ))}
-        </Box>
-      ))}
+      <SectionBlock title="Dimension Metrics" width={contentWidth} marginBottom={0}>
+        {chunk(report.dimensions, dimensionColumns).map((row, rowIndex) => (
+          <Box key={`dimensions-${rowIndex}`}>
+            {row.map((dimension, cardIndex) => (
+              <Box key={dimension.key} marginRight={cardIndex < row.length - 1 ? 1 : 0}>
+                <DimensionCard dimension={dimension} width={dimensionCardWidth} />
+              </Box>
+            ))}
+          </Box>
+        ))}
+      </SectionBlock>
 
-      {diffFiles.length > 0 ? (
-        <>
-          <Text color="gray">CURRENT DIFF</Text>
-          <Box
-            flexDirection="column"
-            borderStyle="round"
-            borderColor="gray"
-            paddingX={1}
-            paddingY={0}
-            marginBottom={report.warnings.length > 0 ? 1 : 0}
-          >
+      {report.git && report.git.files.length > 0 ? (
+        <SectionBlock
+          title="Current Diff from Agent"
+          width={contentWidth}
+          note={
+            hiddenDiffFileCount > 0
+              ? `${diffFiles.length} agent file(s) shown · ${hiddenDiffFileCount} hidden`
+              : `${diffFiles.length} agent file(s)`
+          }
+          marginBottom={report.warnings.length > 0 ? 1 : 0}
+        >
+          {diffFiles.length > 0 ? (
+            <>
             <Box marginBottom={1}>
               <Box width={11}>
                 <Text color="gray">STATUS</Text>
@@ -505,19 +537,23 @@ export function NoiseEvaluationScreen({ scopeLabel, sourceLabel, report }: Noise
             {diffFiles.map((file) => (
               <DiffRow key={`${file.status}-${file.path}`} file={file} pathWidth={diffPathWidth} />
             ))}
-          </Box>
-        </>
+            </>
+          ) : (
+            <Text color="gray" wrap="wrap">
+              No agent-attributed diff files were found in the current working tree.
+            </Text>
+          )}
+        </SectionBlock>
       ) : null}
 
       {report.warnings.length > 0 ? (
-        <Box flexDirection="column">
-          <Text color="yellow">Warnings</Text>
+        <SectionBlock title="Warnings" width={contentWidth} tone="yellow" marginBottom={0}>
           {report.warnings.map((warning, index) => (
             <Text key={`warning-${index}`} color="gray" wrap="wrap">
               - {warning}
             </Text>
           ))}
-        </Box>
+        </SectionBlock>
       ) : null}
     </Box>
   );

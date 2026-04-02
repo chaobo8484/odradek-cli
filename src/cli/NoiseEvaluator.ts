@@ -2,6 +2,13 @@ import { execFile } from 'child_process';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { promisify } from 'util';
+import {
+  parseClaudeTranscriptSession,
+  type TranscriptSource,
+  type ClaudeTranscriptContextItem as ContextItem,
+  type ClaudeTranscriptSession as ParsedSession,
+  type ClaudeTranscriptObservation as ToolObservation,
+} from './ClaudeTranscriptParser.js';
 import { PromptAssetScanner } from './PromptAssetScanner.js';
 import { SkillScanner } from './SkillScanner.js';
 import { estimateTokenCount } from './tokenEstimate.js';
@@ -11,6 +18,7 @@ const execFileAsync = promisify(execFile);
 export type NoiseEvaluationTarget = {
   sessionId: string;
   filePath: string;
+  source?: TranscriptSource;
 };
 
 export type NoiseMetricStatus = 'ok' | 'watch' | 'high' | 'na';
@@ -138,79 +146,10 @@ export type NoiseEvaluationReport = {
   nextActions: string[];
 };
 
-type NormalizedMessage = {
-  order: number;
-  timestampMs: number;
-  role: 'user' | 'assistant' | 'system' | 'unknown';
-  text: string;
-};
-
-type ToolObservation = {
-  id: string;
-  sessionId: string;
-  filePath: string;
-  order: number;
-  timestampMs: number;
-  name: string;
-  input: Record<string, unknown>;
-  inputText: string;
-  resultContent: string;
-  resultTokens: number;
-  estimatedTokens: number;
-  isError: boolean;
-  cwd: string;
-  rawTargetPath: string;
-  targetPath: string;
-  command: string;
-  writePayload: string;
-  stdout: string;
-  stderr: string;
-  interrupted: boolean;
-  successFlag: boolean | null;
-};
-
-type ContextItem = {
-  order: number;
-  tokenCount: number;
-};
-
-type ParsedSession = {
-  sessionId: string;
-  filePath: string;
-  workspaceRoot: string;
-  startTimestampMs: number;
-  endTimestampMs: number;
-  messages: NormalizedMessage[];
-  observations: ToolObservation[];
-  items: ContextItem[];
-};
-
-type PartialObservation = {
-  id: string;
-  sessionId: string;
-  filePath: string;
-  order: number;
-  timestampMs: number;
-  name: string;
-  input: Record<string, unknown>;
-  inputText: string;
-  resultContent?: string;
-  resultTokens?: number;
-  estimatedTokens?: number;
-  isError?: boolean;
-  cwd: string;
-  rawTargetPath: string;
-  targetPath: string;
-  command: string;
-  writePayload: string;
-  stdout?: string;
-  stderr?: string;
-  interrupted?: boolean;
-  successFlag?: boolean | null;
-};
-
 type UsageEvidence = {
   pathMutation: boolean;
+  resultPathFollowup: boolean;
+  sameDirectoryFollowup: boolean;
   pathMentioned: boolean;
   filenameMentioned: boolean;
   strongKeywordHit: boolean;
@@ -350,7 +289,7 @@ export class NoiseEvaluator {
     const totalToolCalls = sessions.reduce((sum, session) => sum + session.observations.length, 0);
 
     if (sessions.length === 0) {
-      warnings.push('No analyzable Claude session JSONL files were found.');
+      warnings.push('No analyzable session JSONL files were found.');
     }
     if (workspaceResolution.multiWorkspace) {
       warnings.push('Multiple workspace roots were detected. Outcome and prompt/context coverage are conservative.');
@@ -379,7 +318,7 @@ export class NoiseEvaluator {
     ];
     const coverage = this.buildCoverage(dimensions, outcomeSummary.git, promptSummary, processSummary);
     const coverageGrade = this.resolveCoverageGrade(coverage);
-    const feasibleScope = this.buildFeasibleScope(dimensions, outcomeSummary.git, promptSummary, validationSummary);
+    const feasibleScope = this.buildFeasibleScope(outcomeSummary.git, promptSummary, validationSummary);
     const nextActions = this.buildNextActions(dimensions, outcomeSummary.git, promptSummary, validationSummary);
 
     return {
@@ -403,167 +342,7 @@ export class NoiseEvaluator {
   }
 
   private async parseSession(target: NoiseEvaluationTarget): Promise<ParsedSession | null> {
-    let raw = '';
-    try {
-      raw = await fs.readFile(target.filePath, 'utf8');
-    } catch {
-      return null;
-    }
-
-    const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
-    const messages: NormalizedMessage[] = [];
-    const observations = new Map<string, PartialObservation>();
-    const items: ContextItem[] = [];
-    const cwdCounts = new Map<string, number>();
-    let startTimestampMs = 0;
-    let endTimestampMs = 0;
-
-    for (let index = 0; index < lines.length; index += 1) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(lines[index]) as unknown;
-      } catch {
-        continue;
-      }
-
-      const envelope = this.extractEnvelope(parsed);
-      if (!envelope) {
-        continue;
-      }
-
-      if (envelope.cwd) {
-        cwdCounts.set(envelope.cwd, (cwdCounts.get(envelope.cwd) ?? 0) + 1);
-      }
-
-      const timestampMs = envelope.timestampMs || this.parseTimestamp(this.getValueAtPath(parsed, ['timestamp'])) || 0;
-      if (timestampMs > 0) {
-        startTimestampMs = startTimestampMs === 0 ? timestampMs : Math.min(startTimestampMs, timestampMs);
-        endTimestampMs = Math.max(endTimestampMs, timestampMs);
-      }
-
-      if (envelope.text) {
-        messages.push({
-          order: index,
-          timestampMs,
-          role: envelope.role,
-          text: envelope.text,
-        });
-        items.push({
-          order: index,
-          tokenCount: estimateTokenCount(envelope.text),
-        });
-      }
-
-      for (const toolUse of envelope.toolUses) {
-        const rawTargetPath = this.extractToolTargetPath(toolUse.name, toolUse.input);
-        const resolvedTargetPath = this.resolveObservationPath(rawTargetPath, envelope.cwd);
-        const partial: PartialObservation = {
-          id: toolUse.id,
-          sessionId: target.sessionId,
-          filePath: target.filePath,
-          order: index,
-          timestampMs,
-          name: toolUse.name,
-          input: toolUse.input,
-          inputText: this.stringifyValue(toolUse.input),
-          cwd: envelope.cwd,
-          rawTargetPath,
-          targetPath: resolvedTargetPath,
-          command: this.extractToolCommand(toolUse.name, toolUse.input),
-          writePayload: this.extractWritePayload(toolUse.name, toolUse.input),
-        };
-        const existing = observations.get(toolUse.id);
-        observations.set(toolUse.id, {
-          ...existing,
-          ...partial,
-          resultContent: existing?.resultContent,
-          resultTokens: existing?.resultTokens,
-          estimatedTokens: existing?.estimatedTokens,
-          isError: existing?.isError,
-          stdout: existing?.stdout,
-          stderr: existing?.stderr,
-          interrupted: existing?.interrupted,
-          successFlag: existing?.successFlag,
-        });
-      }
-
-      const resultMeta = this.extractToolResultMeta(parsed);
-      for (const toolResult of envelope.toolResults) {
-        const existing = observations.get(toolResult.toolUseId);
-        const merged: PartialObservation = {
-          id: toolResult.toolUseId,
-          sessionId: target.sessionId,
-          filePath: target.filePath,
-          order: existing?.order ?? index,
-          timestampMs: existing?.timestampMs ?? timestampMs,
-          name: existing?.name ?? 'unknown',
-          input: existing?.input ?? {},
-          inputText: existing?.inputText ?? '',
-          cwd: existing?.cwd ?? envelope.cwd,
-          rawTargetPath: existing?.rawTargetPath ?? '',
-          targetPath: existing?.targetPath ?? '',
-          command: existing?.command ?? '',
-          writePayload: existing?.writePayload ?? '',
-          resultContent: toolResult.content,
-          resultTokens: estimateTokenCount(toolResult.content),
-          estimatedTokens: this.estimateObservationTokens(existing?.name ?? 'unknown', existing?.input ?? {}, toolResult.content),
-          isError: toolResult.isError,
-          stdout: resultMeta.stdout,
-          stderr: resultMeta.stderr,
-          interrupted: resultMeta.interrupted,
-          successFlag: resultMeta.success,
-        };
-        observations.set(toolResult.toolUseId, merged);
-      }
-    }
-
-    const normalizedObservations = Array.from(observations.values())
-      .map((item) => ({
-        id: item.id,
-        sessionId: item.sessionId,
-        filePath: item.filePath,
-        order: item.order,
-        timestampMs: item.timestampMs,
-        name: item.name,
-        input: item.input,
-        inputText: item.inputText,
-        resultContent: item.resultContent ?? '',
-        resultTokens: item.resultTokens ?? 0,
-        estimatedTokens:
-          item.estimatedTokens ?? this.estimateObservationTokens(item.name, item.input, item.resultContent ?? ''),
-        isError: item.isError ?? false,
-        cwd: item.cwd,
-        rawTargetPath: item.rawTargetPath,
-        targetPath: item.targetPath,
-        command: item.command,
-        writePayload: item.writePayload,
-        stdout: item.stdout ?? '',
-        stderr: item.stderr ?? '',
-        interrupted: item.interrupted ?? false,
-        successFlag: item.successFlag ?? null,
-      }))
-      .sort((a, b) => a.order - b.order || a.timestampMs - b.timestampMs);
-
-    normalizedObservations.forEach((observation) => {
-      if (observation.estimatedTokens <= 0) {
-        return;
-      }
-      items.push({
-        order: observation.order,
-        tokenCount: observation.estimatedTokens,
-      });
-    });
-
-    return {
-      sessionId: target.sessionId,
-      filePath: target.filePath,
-      workspaceRoot: this.resolveMostCommonPath(cwdCounts),
-      startTimestampMs,
-      endTimestampMs,
-      messages,
-      observations: normalizedObservations,
-      items,
-    };
+    return parseClaudeTranscriptSession(target);
   }
 
   private buildOutcomeDimension(outcomeSummary: OutcomeSummary, sessions: ParsedSession[]): NoiseDimensionReport {
@@ -712,7 +491,7 @@ export class NoiseEvaluator {
             value: 'N/A',
             trust: 'T1',
             summary: 'Tool-level session logs are required for process analysis.',
-            missingEvidence: ['Claude JSONL tool traces'],
+            missingEvidence: ['session JSONL tool traces'],
           },
         ],
         signals: [],
@@ -930,7 +709,7 @@ export class NoiseEvaluator {
             value: 'N/A',
             trust: 'T1',
             summary: 'Validation analysis requires assistant claims and tool-run evidence.',
-            missingEvidence: ['Claude JSONL conversation events'],
+            missingEvidence: ['session JSONL conversation events'],
           },
         ],
         signals: [],
@@ -1021,7 +800,7 @@ export class NoiseEvaluator {
       {
         dimension: 'process',
         available: Boolean(process?.available),
-        sources: process?.available ? ['Claude session JSONL tool traces'] : [],
+        sources: process?.available ? ['session JSONL tool traces'] : [],
         reliability: process?.available ? 'high' : 'low',
         notes: process?.available
           ? 'Process signals are deterministic and derived from tool logs.'
@@ -1030,7 +809,7 @@ export class NoiseEvaluator {
       {
         dimension: 'validation',
         available: Boolean(validation?.available),
-        sources: validation?.available ? ['Claude session JSONL assistant messages', 'tool traces'] : [],
+        sources: validation?.available ? ['session JSONL assistant messages', 'tool traces'] : [],
         reliability: validation?.available ? 'high' : 'low',
         notes: validation?.available
           ? 'Validation relies on explicit assistant claims and observed validation commands.'
@@ -1078,7 +857,6 @@ export class NoiseEvaluator {
   }
 
   private buildFeasibleScope(
-    dimensions: NoiseDimensionReport[],
     git: GitDiffSummary | null,
     promptSummary: PromptSummary | null,
     validationSummary: ValidationSummary
@@ -1344,7 +1122,7 @@ export class NoiseEvaluator {
           tokenCount: Math.max(observation.resultTokens, observation.estimatedTokens),
           order: observation.order,
           resultContent: observation.resultContent,
-          usedLater: usage.pathMutation || usage.pathMentioned || usage.strongKeywordHit,
+          usedLater: usage.pathMutation || usage.resultPathFollowup || usage.pathMentioned || usage.strongKeywordHit,
         });
       }
     }
@@ -1576,8 +1354,12 @@ export class NoiseEvaluator {
       const previousRead = lastRead.get(normalizedPath);
       const lastMutation = lastMutationOrder.get(normalizedPath) ?? -1;
       if (previousRead && previousRead.order > lastMutation) {
-        const fingerprintMatched =
-          this.contentFingerprint(previousRead.resultContent) === this.contentFingerprint(observation.resultContent);
+        const overlap = this.describeReadOverlap(previousRead, observation);
+        if (overlap.comparable && !overlap.overlaps) {
+          lastRead.set(normalizedPath, observation);
+          continue;
+        }
+        const fingerprintMatched = this.isEquivalentReadReplay(previousRead, observation, overlap);
         if (fingerprintMatched) {
           const gapTokens = this.sumTokensBetween(session.items, previousRead.order, observation.order);
           const staleRead = gapTokens >= STALE_INTERVENING_TOKENS || observation.order - previousRead.order >= STALE_STEP_GAP;
@@ -1610,6 +1392,7 @@ export class NoiseEvaluator {
                 `previousOrder=${previousRead.order}`,
                 `currentOrder=${observation.order}`,
                 `tokens=${observation.estimatedTokens}`,
+                `overlap=${Math.round(overlap.overlapRatio * 100)}%`,
               ],
             })
           );
@@ -1809,7 +1592,38 @@ export class NoiseEvaluator {
         continue;
       }
       const normalizedPath = this.normalizePathKey(observation.targetPath);
-      if (!normalizedPath || !observation.writePayload) {
+      if (!normalizedPath) {
+        continue;
+      }
+
+      const structuredNoop =
+        (name === 'edit' || name === 'multiedit' || name === 'notebookedit') &&
+        observation.successFlag === true &&
+        observation.structuredPatchCount === 0 &&
+        observation.userModified !== true &&
+        (observation.writePayload.length > 0 || observation.oldString === observation.newString);
+
+      if (structuredNoop) {
+        metrics.writeNoops += 1;
+        signals.push(
+          this.makeSignal(session, {
+            dimension: 'process',
+            key: 'write_noop',
+            label: 'No-op write',
+            status: observation.estimatedTokens >= 800 ? 'high' : 'watch',
+            trust: 'T2',
+            order: observation.order,
+            timestampMs: observation.timestampMs,
+            target: this.toDisplayTarget(observation.targetPath, session.workspaceRoot),
+            tokenImpact: Math.max(observation.estimatedTokens, estimateTokenCount(observation.writePayload)),
+            summary: 'Edit completed without any structured patch output, so the requested change likely did not alter file state.',
+            evidence: [`path=${this.toDisplayTarget(observation.targetPath, session.workspaceRoot)}`],
+          })
+        );
+      }
+
+      if (!observation.writePayload) {
+        lastWriteByPath.set(normalizedPath, observation);
         continue;
       }
 
@@ -1878,8 +1692,14 @@ export class NoiseEvaluator {
           })
         );
       } else {
-        const entryCount = this.estimateEntryCount(observation.resultContent);
-        if (entryCount >= BROAD_SCAN_ENTRY_THRESHOLD && this.isRootLikeScan(observation)) {
+        const entryCount = this.estimateObservationEntryCount(observation);
+        const followupCount = this.countListingFollowups(session, observation);
+        const utilizationRatio = entryCount > 0 ? followupCount / entryCount : 0;
+        if (
+          entryCount >= BROAD_SCAN_ENTRY_THRESHOLD &&
+          this.isRootLikeScan(observation) &&
+          (observation.truncated || followupCount <= 2 || utilizationRatio < 0.12)
+        ) {
           metrics.redundantScans += 1;
           signals.push(
             this.makeSignal(session, {
@@ -1892,8 +1712,14 @@ export class NoiseEvaluator {
               timestampMs: observation.timestampMs,
               target: this.toDisplayTarget(observation.targetPath || observation.command, session.workspaceRoot),
               tokenImpact: observation.estimatedTokens,
-              summary: 'Broad root-like directory scan pulled a large result set.',
-              evidence: [`entries~=${entryCount}`],
+              summary: observation.truncated
+                ? 'Broad root-like directory scan truncated the result before the session meaningfully narrowed scope.'
+                : 'Broad root-like directory scan pulled a large result set with low downstream utilization.',
+              evidence: [
+                `entries~=${entryCount}`,
+                `followups=${followupCount}`,
+                `utilization=${Math.round(utilizationRatio * 100)}%`,
+              ],
             })
           );
         }
@@ -1981,9 +1807,11 @@ export class NoiseEvaluator {
     const usage = this.scoreUsageEvidence(session, observation);
     let score = 0;
     if (usage.pathMutation) score += 1;
-    if (usage.pathMentioned) score += 0.8;
+    if (usage.resultPathFollowup) score += 0.95;
+    if (usage.sameDirectoryFollowup) score += 0.55;
+    if (usage.pathMentioned) score += 0.75;
     if (usage.filenameMentioned) score += 0.4;
-    if (usage.strongKeywordHit) score += 0.5;
+    if (usage.strongKeywordHit) score += 0.45;
     if (usage.weakKeywordHit) score += 0.1;
     return Math.min(1, score);
   }
@@ -1992,18 +1820,35 @@ export class NoiseEvaluator {
     const normalizedPath = this.normalizePathKey(observation.targetPath);
     const displayPath = this.toDisplayTarget(observation.targetPath, session.workspaceRoot).toLowerCase();
     const baseName = path.basename(observation.targetPath).toLowerCase();
+    const futureObservations = session.observations
+      .filter((next) => next.order > observation.order)
+      .slice(0, 25);
+    const futureMessages = session.messages
+      .filter((message) => message.order > observation.order && !message.isSynthetic)
+      .slice(0, 25);
 
     const pathMutation = normalizedPath
-      ? session.observations.some(
+      ? futureObservations.some(
           (next) =>
-            next.order > observation.order &&
             TOOL_MUTATION_NAMES.has(next.name.toLowerCase()) &&
             this.normalizePathKey(next.targetPath) === normalizedPath
         )
       : false;
+    const resultPathSet = new Set(
+      (observation.resultPaths.length > 0 ? observation.resultPaths : [observation.targetPath])
+        .map((candidate) => this.normalizePathKey(candidate))
+        .filter(Boolean)
+    );
+    const resultPathFollowup = resultPathSet.size > 0 && futureObservations.some((next) => {
+      const nextPath = this.normalizePathKey(next.targetPath);
+      return nextPath ? resultPathSet.has(nextPath) : false;
+    });
+    const sameDirectoryFollowup = this.hasSameDirectoryFollowup(observation, futureObservations);
     if (pathMutation) {
       return {
         pathMutation: true,
+        resultPathFollowup,
+        sameDirectoryFollowup,
         pathMentioned: false,
         filenameMentioned: false,
         strongKeywordHit: false,
@@ -2011,17 +1856,13 @@ export class NoiseEvaluator {
       };
     }
 
-    const futureMessages = session.messages
-      .filter((message) => message.order > observation.order)
-      .slice(0, 20)
+    const futureMessageText = futureMessages
       .map((message) => message.text.toLowerCase())
       .join('\n');
-    const futureInputs = session.observations
-      .filter((next) => next.order > observation.order)
-      .slice(0, 20)
+    const futureInputs = futureObservations
       .map((next) => `${next.inputText}\n${next.command}`.toLowerCase())
       .join('\n');
-    const futureText = `${futureMessages}\n${futureInputs}`;
+    const futureText = `${futureMessageText}\n${futureInputs}`;
     const pathMentioned = displayPath.length >= 4 && futureText.includes(displayPath);
     const filenameMentioned = baseName.length >= 3 && futureText.includes(baseName);
     const keywords = this.extractSignalKeywords(observation.resultContent || observation.command || '');
@@ -2030,6 +1871,8 @@ export class NoiseEvaluator {
 
     return {
       pathMutation,
+      resultPathFollowup,
+      sameDirectoryFollowup,
       pathMentioned,
       filenameMentioned,
       strongKeywordHit,
@@ -2065,6 +1908,125 @@ export class NoiseEvaluator {
       strong: strong.slice(0, 8),
       weak: weak.slice(0, 8),
     };
+  }
+
+  private describeReadOverlap(
+    previous: ToolObservation,
+    current: ToolObservation
+  ): { comparable: boolean; overlaps: boolean; sameRange: boolean; overlapRatio: number } {
+    if (!previous.fileRange || !current.fileRange) {
+      return { comparable: false, overlaps: true, sameRange: true, overlapRatio: 1 };
+    }
+
+    const previousStart = previous.fileRange.startLine;
+    const previousEnd = previousStart + Math.max(0, previous.fileRange.numLines - 1);
+    const currentStart = current.fileRange.startLine;
+    const currentEnd = currentStart + Math.max(0, current.fileRange.numLines - 1);
+    const overlapStart = Math.max(previousStart, currentStart);
+    const overlapEnd = Math.min(previousEnd, currentEnd);
+    const overlaps = overlapStart <= overlapEnd;
+    const overlapLines = overlaps ? overlapEnd - overlapStart + 1 : 0;
+    const denominator = Math.max(1, Math.min(previous.fileRange.numLines, current.fileRange.numLines));
+    return {
+      comparable: true,
+      overlaps,
+      sameRange: previousStart === currentStart && previous.fileRange.numLines === current.fileRange.numLines,
+      overlapRatio: overlapLines / denominator,
+    };
+  }
+
+  private isEquivalentReadReplay(
+    previous: ToolObservation,
+    current: ToolObservation,
+    overlap: { comparable: boolean; overlaps: boolean; sameRange: boolean; overlapRatio: number }
+  ): boolean {
+    if (this.contentFingerprint(previous.resultContent) === this.contentFingerprint(current.resultContent)) {
+      return true;
+    }
+    if (!overlap.comparable || !overlap.overlaps || overlap.overlapRatio < 0.85) {
+      return false;
+    }
+    const previousText = this.normalizeComparableText(previous.resultContent);
+    const currentText = this.normalizeComparableText(current.resultContent);
+    if (previousText.length < 80 || currentText.length < 80) {
+      return false;
+    }
+    return previousText.includes(currentText) || currentText.includes(previousText);
+  }
+
+  private countListingFollowups(session: ParsedSession, observation: ToolObservation): number {
+    const futureObservations = session.observations
+      .filter((next) => next.order > observation.order)
+      .slice(0, 25);
+    const resultPathSet = new Set(observation.resultPaths.map((candidate) => this.normalizePathKey(candidate)).filter(Boolean));
+
+    if (resultPathSet.size > 0) {
+      const matched = new Set<string>();
+      for (const next of futureObservations) {
+        const nextPath = this.normalizePathKey(next.targetPath);
+        if (nextPath && resultPathSet.has(nextPath)) {
+          matched.add(nextPath);
+        }
+      }
+      return matched.size;
+    }
+
+    const baseDirectory = this.normalizePathKey(observation.targetPath);
+    if (!baseDirectory) {
+      return 0;
+    }
+    const matched = new Set<string>();
+    for (const next of futureObservations) {
+      const nextPath = this.normalizePathKey(next.targetPath);
+      if (nextPath && nextPath.startsWith(`${baseDirectory}\\`)) {
+        matched.add(nextPath);
+      }
+    }
+    return matched.size;
+  }
+
+  private estimateObservationEntryCount(observation: ToolObservation): number {
+    if (typeof observation.numFiles === 'number' && observation.numFiles > 0) {
+      return observation.numFiles;
+    }
+    if (observation.resultPaths.length > 0) {
+      return observation.resultPaths.length;
+    }
+    return this.estimateEntryCount(observation.resultContent);
+  }
+
+  private hasSameDirectoryFollowup(observation: ToolObservation, futureObservations: ToolObservation[]): boolean {
+    const baseDirectory = this.resolveObservationDirectory(observation);
+    if (!baseDirectory) {
+      return false;
+    }
+    return futureObservations.some((next) => {
+      const nextPath = this.normalizePathKey(next.targetPath);
+      return nextPath ? nextPath.startsWith(`${baseDirectory}\\`) : false;
+    });
+  }
+
+  private resolveObservationDirectory(observation: ToolObservation): string {
+    const normalizedPath = this.normalizePathKey(observation.targetPath);
+    if (!normalizedPath) {
+      return '';
+    }
+    if (DIRECTORY_TOOLS.has(observation.name.toLowerCase()) || this.looksLikeDirectoryPath(observation.targetPath)) {
+      return normalizedPath;
+    }
+    return this.normalizePathKey(path.dirname(observation.targetPath));
+  }
+
+  private looksLikeDirectoryPath(candidatePath: string): boolean {
+    if (!candidatePath) {
+      return false;
+    }
+    const trimmed = candidatePath.replace(/[\\/]+$/, '');
+    return path.extname(trimmed) === '';
+  }
+
+  private normalizeComparableText(text: string): string {
+    return text.replace(/\s+/g, ' ').trim().toLowerCase();
   }
 
   private compareSignals(left: NoiseSignal, right: NoiseSignal): number {
@@ -2240,355 +2202,6 @@ export class NoiseEvaluator {
     return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(`${normalizedRoot}${path.sep}`);
   }
 
-  private resolveMostCommonPath(counts: Map<string, number>): string {
-    let winner = '';
-    let best = 0;
-    counts.forEach((count, value) => {
-      if (count > best) {
-        best = count;
-        winner = value;
-      }
-    });
-    return winner ? path.resolve(winner) : '';
-  }
-
-  private extractEnvelope(payload: unknown): {
-    role: 'user' | 'assistant' | 'system' | 'unknown';
-    text: string;
-    toolUses: Array<{ id: string; name: string; input: Record<string, unknown> }>;
-    toolResults: Array<{ toolUseId: string; content: string; isError: boolean }>;
-    timestampMs: number;
-    cwd: string;
-  } | null {
-    const direct = this.readMessageShape(payload);
-    if (direct) {
-      return direct;
-    }
-    const nestedMessage =
-      this.getObjectAtPath(payload, ['data', 'message', 'message']) ??
-      this.getObjectAtPath(payload, ['data', 'message']);
-    if (nestedMessage) {
-      const envelope = this.readMessageShape(nestedMessage, payload);
-      if (envelope) {
-        return envelope;
-      }
-    }
-    return null;
-  }
-
-  private readMessageShape(
-    messagePayload: Record<string, unknown> | unknown,
-    fallbackPayload?: unknown
-  ): {
-    role: 'user' | 'assistant' | 'system' | 'unknown';
-    text: string;
-    toolUses: Array<{ id: string; name: string; input: Record<string, unknown> }>;
-    toolResults: Array<{ toolUseId: string; content: string; isError: boolean }>;
-    timestampMs: number;
-    cwd: string;
-  } | null {
-    if (!messagePayload || typeof messagePayload !== 'object' || Array.isArray(messagePayload)) {
-      return null;
-    }
-    const record = messagePayload as Record<string, unknown>;
-    const roleValue = typeof record.role === 'string' ? record.role : '';
-    const content = record.content;
-    if (!roleValue && content === undefined) {
-      return null;
-    }
-
-    const role =
-      roleValue === 'assistant'
-        ? 'assistant'
-        : roleValue === 'user'
-        ? 'user'
-        : roleValue === 'system'
-        ? 'system'
-        : 'unknown';
-
-    const blocks = this.normalizeContentBlocks(content);
-    const textSegments: string[] = [];
-    const toolUses: Array<{ id: string; name: string; input: Record<string, unknown> }> = [];
-    const toolResults: Array<{ toolUseId: string; content: string; isError: boolean }> = [];
-
-    for (const block of blocks) {
-      if (block.type === 'tool_use') {
-        if (block.id && block.name) {
-          toolUses.push({ id: block.id, name: block.name, input: block.input });
-        }
-        continue;
-      }
-      if (block.type === 'tool_result') {
-        if (block.toolUseId) {
-          toolResults.push({
-            toolUseId: block.toolUseId,
-            content: block.text,
-            isError: block.isError,
-          });
-        }
-        continue;
-      }
-      if (block.text) {
-        textSegments.push(block.text);
-      }
-    }
-
-    const text = this.normalizeMessageText(textSegments.join('\n'));
-    const timestampMs =
-      this.parseTimestamp(record.timestamp) ||
-      this.parseTimestamp(this.getValueAtPath(fallbackPayload, ['data', 'message', 'timestamp'])) ||
-      this.parseTimestamp(this.getValueAtPath(fallbackPayload, ['timestamp'])) ||
-      0;
-    const cwd =
-      this.getStringAtPaths(fallbackPayload, [['cwd']]) ??
-      this.getStringAtPaths(record, [['cwd']]) ??
-      '';
-
-    return {
-      role,
-      text,
-      toolUses,
-      toolResults,
-      timestampMs,
-      cwd,
-    };
-  }
-
-  private normalizeContentBlocks(content: unknown): Array<{
-    type: 'text' | 'tool_use' | 'tool_result';
-    text: string;
-    id: string;
-    name: string;
-    input: Record<string, unknown>;
-    toolUseId: string;
-    isError: boolean;
-  }> {
-    if (typeof content === 'string') {
-      return [
-        {
-          type: 'text',
-          text: content,
-          id: '',
-          name: '',
-          input: {},
-          toolUseId: '',
-          isError: false,
-        },
-      ];
-    }
-    if (!Array.isArray(content)) {
-      return [];
-    }
-    return content
-      .map((item) => {
-        if (!item || typeof item !== 'object' || Array.isArray(item)) {
-          return null;
-        }
-        const record = item as Record<string, unknown>;
-        const type = typeof record.type === 'string' ? record.type : 'text';
-        if (type === 'tool_use') {
-          return {
-            type: 'tool_use' as const,
-            text: '',
-            id: typeof record.id === 'string' ? record.id : '',
-            name: typeof record.name === 'string' ? record.name : '',
-            input:
-              record.input && typeof record.input === 'object' && !Array.isArray(record.input)
-                ? (record.input as Record<string, unknown>)
-                : {},
-            toolUseId: '',
-            isError: false,
-          };
-        }
-        if (type === 'tool_result') {
-          return {
-            type: 'tool_result' as const,
-            text: this.normalizeToolResultContent(record.content),
-            id: '',
-            name: '',
-            input: {},
-            toolUseId: typeof record.tool_use_id === 'string' ? record.tool_use_id : '',
-            isError: record.is_error === true,
-          };
-        }
-        return {
-          type: 'text' as const,
-          text:
-            typeof record.text === 'string'
-              ? record.text
-              : typeof record.content === 'string'
-              ? record.content
-              : '',
-          id: '',
-          name: '',
-          input: {},
-          toolUseId: '',
-          isError: false,
-        };
-      })
-      .filter(
-        (
-          item
-        ): item is {
-          type: 'text' | 'tool_use' | 'tool_result';
-          text: string;
-          id: string;
-          name: string;
-          input: Record<string, unknown>;
-          toolUseId: string;
-          isError: boolean;
-        } => item !== null
-      );
-  }
-
-  private normalizeToolResultContent(content: unknown): string {
-    if (typeof content === 'string') {
-      return content.trim();
-    }
-    if (Array.isArray(content)) {
-      return content
-        .map((item) => {
-          if (typeof item === 'string') {
-            return item;
-          }
-          if (item && typeof item === 'object' && !Array.isArray(item)) {
-            const record = item as Record<string, unknown>;
-            if (typeof record.text === 'string') {
-              return record.text;
-            }
-            if (typeof record.content === 'string') {
-              return record.content;
-            }
-          }
-          return '';
-        })
-        .join('\n')
-        .trim();
-    }
-    return '';
-  }
-
-  private normalizeMessageText(input: string): string {
-    const normalized = input.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-    if (!normalized) {
-      return '';
-    }
-    if (
-      normalized.includes('<local-command-caveat>') ||
-      normalized.includes('<local-command-stdout>') ||
-      normalized.includes('<command-name>')
-    ) {
-      return '';
-    }
-    return normalized;
-  }
-
-  private extractToolResultMeta(payload: unknown): {
-    stdout: string;
-    stderr: string;
-    interrupted: boolean;
-    success: boolean | null;
-  } {
-    const record =
-      this.getObjectAtPath(payload, ['toolUseResult']) ??
-      this.getObjectAtPath(payload, ['data', 'toolUseResult']);
-    if (!record) {
-      return {
-        stdout: '',
-        stderr: '',
-        interrupted: false,
-        success: null,
-      };
-    }
-    const successValue = this.getValueAtPath(record, ['success']);
-    return {
-      stdout: this.getStringAtPaths(record, [['stdout']]) ?? '',
-      stderr: this.getStringAtPaths(record, [['stderr']]) ?? '',
-      interrupted: this.getValueAtPath(record, ['interrupted']) === true,
-      success: typeof successValue === 'boolean' ? successValue : null,
-    };
-  }
-
-  private estimateObservationTokens(name: string, input: Record<string, unknown>, resultContent: string): number {
-    const resultTokens = estimateTokenCount(resultContent);
-    const inputTokens = estimateTokenCount(this.stringifyValue(input));
-    const writeTokens = estimateTokenCount(this.extractWritePayload(name, input));
-    const minimumToolFootprint = name.toLowerCase() === 'read' ? 0 : 12;
-    return Math.max(resultTokens, inputTokens, writeTokens, minimumToolFootprint);
-  }
-
-  private extractToolTargetPath(name: string, input: Record<string, unknown>): string {
-    return (
-      this.getStringAtPaths(input, [['file_path'], ['filePath'], ['path'], ['directory'], ['dir'], ['cwd']]) ??
-      (name.toLowerCase() === 'bash' ? this.extractPathFromCommand(this.extractToolCommand(name, input)) : '') ??
-      ''
-    );
-  }
-
-  private extractToolCommand(name: string, input: Record<string, unknown>): string {
-    if (name.toLowerCase() !== 'bash') {
-      return this.getStringAtPaths(input, [['description']]) ?? '';
-    }
-    return this.getStringAtPaths(input, [['command'], ['cmd']]) ?? '';
-  }
-
-  private extractWritePayload(name: string, input: Record<string, unknown>): string {
-    if (!TOOL_MUTATION_NAMES.has(name.toLowerCase())) {
-      return '';
-    }
-    const direct =
-      this.getStringAtPaths(input, [['content'], ['new_string'], ['newString'], ['newText'], ['text'], ['patch']]) ??
-      '';
-    if (direct) {
-      return direct;
-    }
-    const edits = this.getValueAtPath(input, ['edits']);
-    if (Array.isArray(edits)) {
-      return edits
-        .map((item) => {
-          if (!item || typeof item !== 'object' || Array.isArray(item)) {
-            return '';
-          }
-          const record = item as Record<string, unknown>;
-          return [
-            typeof record.old_string === 'string' ? record.old_string : '',
-            typeof record.new_string === 'string' ? record.new_string : '',
-          ]
-            .filter(Boolean)
-            .join('\n');
-        })
-        .filter(Boolean)
-        .join('\n');
-    }
-    return '';
-  }
-
-  private resolveObservationPath(rawTargetPath: string, cwd: string): string {
-    const trimmed = rawTargetPath.trim();
-    if (!trimmed) {
-      return '';
-    }
-    if (path.isAbsolute(trimmed)) {
-      return path.normalize(trimmed);
-    }
-    if (!cwd) {
-      return path.normalize(trimmed);
-    }
-    return path.resolve(cwd, trimmed);
-  }
-
-  private extractPathFromCommand(command: string): string {
-    if (!command) {
-      return '';
-    }
-    const quoted = command.match(/["']([A-Za-z]:[\\/][^"']+|\.{0,2}[\\/][^"']+)["']/);
-    if (quoted?.[1]) {
-      return quoted[1];
-    }
-    const bare = command.match(/(?:ls|dir|tree|find|Get-ChildItem|rg --files)\s+([A-Za-z]:[\\/][^\s]+|\.{0,2}[\\/][^\s]+)/i);
-    return bare?.[1] ?? '';
-  }
-
   private contentFingerprint(content: string): string {
     if (!content) {
       return '';
@@ -2689,12 +2302,6 @@ export class NoiseEvaluator {
     }
   }
 
-  private getObjectAtPath(payload: unknown, keyPath: string[]): Record<string, unknown> | null {
-    const value = this.getValueAtPath(payload, keyPath);
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-    return value as Record<string, unknown>;
-  }
-
   private getStringAtPaths(payload: unknown, keyPaths: string[][]): string | null {
     for (const keyPath of keyPaths) {
       const value = this.getValueAtPath(payload, keyPath);
@@ -2712,26 +2319,6 @@ export class NoiseEvaluator {
       current = (current as Record<string, unknown>)[key];
     }
     return current;
-  }
-
-  private parseTimestamp(value: unknown): number {
-    if (typeof value === 'number' && Number.isFinite(value)) {
-      if (value > 1000000000000) return value;
-      if (value > 1000000000) return value * 1000;
-      return 0;
-    }
-    if (typeof value !== 'string') return 0;
-    const trimmed = value.trim();
-    if (!trimmed) return 0;
-    if (/^\d+(\.\d+)?$/.test(trimmed)) {
-      const numeric = Number(trimmed);
-      if (!Number.isFinite(numeric)) return 0;
-      if (numeric > 1000000000000) return numeric;
-      if (numeric > 1000000000) return numeric * 1000;
-      return 0;
-    }
-    const parsed = Date.parse(trimmed);
-    return Number.isNaN(parsed) ? 0 : parsed;
   }
 
   private normalizePathKey(filePath: string): string {

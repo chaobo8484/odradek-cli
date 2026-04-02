@@ -1,9 +1,11 @@
 import { promises as fs } from 'fs';
 import path from 'path';
+import { parseClaudeTranscriptSession, type TranscriptSource } from './ClaudeTranscriptParser.js';
 
 export type TodoGranularityTarget = {
   sessionId: string;
   filePath: string;
+  source?: TranscriptSource;
 };
 
 export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'unknown';
@@ -40,7 +42,7 @@ export type TodoGranularityItem = {
   completedAtMs: number | null;
   firstSeenAtMs: number | null;
   lastSeenAtMs: number | null;
-  source: 'todo_file' | 'jsonl_snapshot';
+  source: 'todo_file' | 'jsonl_snapshot' | 'codex_update_plan' | 'codex_proposed_plan' | 'codex_message_plan';
   granularityScore: number;
   granularitySignals: string[];
   contextUsage: TodoContextUsage | null;
@@ -85,7 +87,7 @@ type TodoSeed = {
   completedAtMs: number | null;
   firstSeenAtMs: number | null;
   lastSeenAtMs: number | null;
-  source: 'todo_file' | 'jsonl_snapshot';
+  source: 'todo_file' | 'jsonl_snapshot' | 'codex_update_plan' | 'codex_proposed_plan' | 'codex_message_plan';
 };
 
 type UsageRecord = {
@@ -111,23 +113,30 @@ export class TodoGranularityAnalyzer {
     const warnings: string[] = [];
     const todoFileIndex = await this.buildTodoFileIndex();
     const items: TodoGranularityItem[] = [];
+    const targetSources = new Set(targets.map((target) => target.source ?? 'claude'));
 
     let sessionsWithTodos = 0;
     let sessionsWithTodoFiles = 0;
     let sessionsUsingSnapshotFallback = 0;
 
     for (const target of targets) {
-      const todoFilePath = todoFileIndex.get(target.sessionId) ?? null;
+      const source = target.source ?? 'claude';
+      const todoFilePath = source === 'claude' ? (todoFileIndex.get(target.sessionId) ?? null) : null;
       if (todoFilePath) {
         sessionsWithTodoFiles += 1;
       }
 
       let todoSeeds = todoFilePath ? await this.readTodoSeedsFromFile(todoFilePath, target.sessionId) : [];
       if (todoSeeds.length === 0) {
-        const fallbackSeeds = await this.readTodoSeedsFromJsonlSnapshots(target.filePath, target.sessionId);
+        const fallbackSeeds =
+          source === 'codex'
+            ? await this.readTodoSeedsFromCodexTranscript(target)
+            : await this.readTodoSeedsFromJsonlSnapshots(target.filePath, target.sessionId);
         if (fallbackSeeds.length > 0) {
           todoSeeds = fallbackSeeds;
-          sessionsUsingSnapshotFallback += 1;
+          if (!fallbackSeeds.some((item) => item.source === 'codex_update_plan')) {
+            sessionsUsingSnapshotFallback += 1;
+          }
         }
       }
 
@@ -136,7 +145,7 @@ export class TodoGranularityAnalyzer {
       }
 
       sessionsWithTodos += 1;
-      const usageRecords = await this.readUsageRecords(target.filePath);
+      const usageRecords = await this.readUsageRecords(target.filePath, source);
       const sessionTotals = this.sumUsage(usageRecords);
       const sessionBounds = this.getUsageBounds(usageRecords);
 
@@ -152,13 +161,15 @@ export class TodoGranularityAnalyzer {
       }
     }
 
-    if (!this.todosRoot) {
-      warnings.push('Could not find ~/.claude/todos, so the analysis used session JSONL snapshots only.');
+    if (targetSources.has('claude') && !this.todosRoot) {
+      warnings.push('Could not find ~/.claude/todos, so Claude analysis used session JSONL snapshots only.');
     }
 
     if (items.length === 0) {
       warnings.push(
-        'No analyzable todo data was found. The current Claude sessions may have empty todo files, or no todo snapshots were written.'
+        targetSources.size === 1 && targetSources.has('codex')
+          ? 'Codex session lacks stable todo artifacts.'
+          : 'No analyzable todo data was found across the selected sessions.'
       );
     }
 
@@ -329,6 +340,119 @@ export class TodoGranularityAnalyzer {
     });
   }
 
+  private async readTodoSeedsFromCodexTranscript(target: TodoGranularityTarget): Promise<TodoSeed[]> {
+    const session = await parseClaudeTranscriptSession({
+      sessionId: target.sessionId,
+      filePath: target.filePath,
+      source: 'codex',
+    });
+    if (!session) {
+      return [];
+    }
+
+    const merged = new Map<string, TodoSeed>();
+    const mergeSeed = (seed: TodoSeed): void => {
+      const key = this.buildTodoSnapshotKey(seed);
+      const existing = merged.get(key);
+      if (!existing) {
+        merged.set(key, seed);
+        return;
+      }
+      existing.content = seed.content || existing.content;
+      existing.rawStatus = seed.rawStatus || existing.rawStatus;
+      existing.status =
+        seed.status !== 'unknown'
+          ? seed.status
+          : existing.status !== 'unknown'
+          ? existing.status
+          : 'unknown';
+      existing.createdAtMs = this.minTimestamp(existing.createdAtMs, seed.createdAtMs);
+      existing.updatedAtMs = this.maxTimestamp(existing.updatedAtMs, seed.updatedAtMs);
+      existing.completedAtMs = this.maxTimestamp(existing.completedAtMs, seed.completedAtMs);
+      existing.firstSeenAtMs = this.minTimestamp(existing.firstSeenAtMs, seed.firstSeenAtMs);
+      existing.lastSeenAtMs = this.maxTimestamp(existing.lastSeenAtMs, seed.lastSeenAtMs);
+    };
+
+    let updatePlanIndex = 0;
+    for (const observation of session.observations) {
+      if (observation.sourceToolName !== 'update_plan') {
+        continue;
+      }
+      const plan = observation.input.plan;
+      if (!Array.isArray(plan)) {
+        continue;
+      }
+      plan.forEach((item, itemIndex) => {
+        const normalized = this.normalizeTodoSeed(item, target.sessionId, 'codex_update_plan', updatePlanIndex + itemIndex);
+        if (!normalized) {
+          return;
+        }
+        mergeSeed({
+          ...normalized,
+          createdAtMs: normalized.createdAtMs ?? observation.timestampMs,
+          updatedAtMs: normalized.updatedAtMs ?? observation.timestampMs,
+          completedAtMs:
+            normalized.completedAtMs ?? (normalized.status === 'completed' ? observation.timestampMs : null),
+          firstSeenAtMs: normalized.firstSeenAtMs ?? observation.timestampMs,
+          lastSeenAtMs: normalized.lastSeenAtMs ?? observation.timestampMs,
+        });
+      });
+      updatePlanIndex += plan.length;
+    }
+
+    if (merged.size > 0) {
+      return Array.from(merged.values());
+    }
+
+    let fallbackIndex = 0;
+    for (const message of session.messages.filter((item) => item.role === 'assistant')) {
+      const proposedPlanBlocks = this.extractProposedPlanBlocks(message.text);
+      for (const block of proposedPlanBlocks) {
+        this.extractPlanLines(block, { topLevelOnly: true }).forEach((line) => {
+          const seed = this.normalizeTodoSeed(line, target.sessionId, 'codex_proposed_plan', fallbackIndex);
+          fallbackIndex += 1;
+          if (!seed) {
+            return;
+          }
+          mergeSeed({
+            ...seed,
+            createdAtMs: message.timestampMs || null,
+            updatedAtMs: message.timestampMs || null,
+            firstSeenAtMs: message.timestampMs || null,
+            lastSeenAtMs: message.timestampMs || null,
+          });
+        });
+      }
+    }
+
+    if (merged.size > 0) {
+      return Array.from(merged.values());
+    }
+
+    for (const message of session.messages.filter((item) => item.role === 'assistant')) {
+      const planLines = this.extractPlanLines(message.text);
+      if (planLines.length < 2) {
+        continue;
+      }
+      planLines.forEach((line) => {
+        const seed = this.normalizeTodoSeed(line, target.sessionId, 'codex_message_plan', fallbackIndex);
+        fallbackIndex += 1;
+        if (!seed) {
+          return;
+        }
+        mergeSeed({
+          ...seed,
+          createdAtMs: message.timestampMs || null,
+          updatedAtMs: message.timestampMs || null,
+          firstSeenAtMs: message.timestampMs || null,
+          lastSeenAtMs: message.timestampMs || null,
+        });
+      });
+    }
+
+    return Array.from(merged.values());
+  }
+
   private buildTodoSnapshotKey(seed: TodoSeed): string {
     const normalizedContent = seed.content.trim().toLowerCase();
     if (seed.todoId && !seed.todoId.startsWith('todo-')) {
@@ -337,10 +461,36 @@ export class TodoGranularityAnalyzer {
     return `${seed.sessionId}:${normalizedContent}`;
   }
 
+  private extractProposedPlanBlocks(text: string): string[] {
+    const blocks: string[] = [];
+    const pattern = /<proposed_plan>\s*([\s\S]*?)<\/proposed_plan>/gi;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text)) !== null) {
+      const block = match[1]?.trim();
+      if (block) {
+        blocks.push(block);
+      }
+    }
+    return blocks;
+  }
+
+  private extractPlanLines(text: string, options?: { topLevelOnly?: boolean }): string[] {
+    return text
+      .split(/\r?\n/)
+      .map((line) => {
+        if (options?.topLevelOnly && /^\s+/.test(line)) {
+          return '';
+        }
+        const matched = line.trim().match(/^(?:[-*]\s+|\d+\.\s+|\[[xX\s]\]\s+)(.+)$/);
+        return matched?.[1]?.trim() ?? '';
+      })
+      .filter((line) => line.length > 0);
+  }
+
   private normalizeTodoSeed(
     payload: unknown,
     sessionId: string,
-    source: 'todo_file' | 'jsonl_snapshot',
+    source: 'todo_file' | 'jsonl_snapshot' | 'codex_update_plan' | 'codex_proposed_plan' | 'codex_message_plan',
     index: number
   ): TodoSeed | null {
     if (typeof payload === 'string') {
@@ -447,7 +597,7 @@ export class TodoGranularityAnalyzer {
     return 'unknown';
   }
 
-  private async readUsageRecords(filePath: string): Promise<UsageRecord[]> {
+  private async readUsageRecords(filePath: string, source: TranscriptSource): Promise<UsageRecord[]> {
     let raw = '';
     let fileTimestampMs = 0;
     try {
@@ -458,8 +608,9 @@ export class TodoGranularityAnalyzer {
       return [];
     }
 
-    const records: UsageRecord[] = [];
     const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
+    const codexDefaults = source === 'codex' ? this.readCodexUsageDefaults(lines) : null;
+    const records: UsageRecord[] = [];
     for (const line of lines) {
       let parsed: unknown;
       try {
@@ -468,7 +619,7 @@ export class TodoGranularityAnalyzer {
         continue;
       }
 
-      const record = this.extractUsageRecord(parsed, line, fileTimestampMs);
+      const record = this.extractUsageRecord(parsed, line, fileTimestampMs, source, codexDefaults);
       if (record) {
         records.push(record);
       }
@@ -477,7 +628,67 @@ export class TodoGranularityAnalyzer {
     return records.sort((a, b) => a.timestampMs - b.timestampMs);
   }
 
-  private extractUsageRecord(payload: unknown, rawLine: string, fileTimestampMs: number): UsageRecord | null {
+  private readCodexUsageDefaults(lines: string[]): { contextWindowTokens: number | null } {
+    let contextWindowTokens: number | null = null;
+    for (const line of lines.slice(0, 80)) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line) as unknown;
+      } catch {
+        continue;
+      }
+      contextWindowTokens =
+        this.getNumberAtPaths(parsed, [['payload', 'model_context_window'], ['payload', 'info', 'model_context_window']]) ??
+        contextWindowTokens;
+    }
+    return { contextWindowTokens };
+  }
+
+  private extractUsageRecord(
+    payload: unknown,
+    rawLine: string,
+    fileTimestampMs: number,
+    source: TranscriptSource,
+    codexDefaults?: { contextWindowTokens: number | null } | null
+  ): UsageRecord | null {
+    if (source === 'codex') {
+      const topType = this.getStringAtPaths(payload, [['type']])?.toLowerCase() ?? '';
+      const payloadType = this.getStringAtPaths(payload, [['payload', 'type']])?.toLowerCase() ?? '';
+      if (topType !== 'event_msg' || payloadType !== 'token_count') {
+        return null;
+      }
+
+      const usageObject = this.getObjectAtPath(payload, ['payload', 'info', 'last_token_usage']);
+      const inputTokens = this.getNumberAtPaths(usageObject, [['input_tokens']]) ?? 0;
+      const outputTokens =
+        this.getNumberAtPaths(usageObject, [['output_tokens'], ['reasoning_output_tokens']]) ?? 0;
+      const cacheReadTokens =
+        this.getNumberAtPaths(usageObject, [['cached_input_tokens'], ['cache_read_input_tokens']]) ?? 0;
+      const contextWindowTokens =
+        this.getNumberAtPaths(payload, [['payload', 'info', 'model_context_window'], ['payload', 'model_context_window']]) ??
+        codexDefaults?.contextWindowTokens ??
+        null;
+
+      const totalTokens =
+        this.getNumberAtPaths(usageObject, [['total_tokens']]) ??
+        inputTokens + outputTokens + cacheReadTokens;
+      if (totalTokens <= 0 && contextWindowTokens === null) {
+        return null;
+      }
+
+      return {
+        timestampMs: this.extractTimestampMs(payload) || fileTimestampMs,
+        inputTokens,
+        outputTokens,
+        cacheCreationTokens: 0,
+        cacheReadTokens,
+        totalTokens,
+        contextUsedPercent: null,
+        contextWindowTokens,
+        truncated: this.detectTruncation(payload, rawLine, null),
+      };
+    }
+
     const usageObject =
       this.getObjectAtPath(payload, ['message', 'usage']) ??
       this.getObjectAtPath(payload, ['usage']) ??

@@ -21,7 +21,11 @@ export class CommandRegistry {
     this.register({ name: 'expand', description: 'Expand messages', usage: '/expand [id|all]' });
     this.register({ name: 'exit', description: 'Exit the program', aliases: ['quit'], usage: '/exit' });
     this.register({ name: 'analyze', description: 'Analyze conversation pattern', usage: '/analyze' });
-    this.register({ name: 'export', description: 'Export conversation history', usage: '/export [filename]' });
+    this.register({
+      name: 'export',
+      description: 'Export current diagnostic data as JSON for Claude or Codex sessions',
+      usage: '/export [claude|codex]',
+    });
     this.register({
       name: 'model',
       description: 'Set the active API model for the current provider',
@@ -64,33 +68,33 @@ export class CommandRegistry {
     });
     this.register({
       name: 'scan_tokens',
-      description: 'Parse Claude JSONL token structures and render token analytics',
+      description: 'Parse Claude or Codex session JSONL token structures and render token analytics',
       aliases: ['scantokens', 'tokenscan'],
-      usage: '/scan_tokens [current|all|path]',
+      usage: '/scan_tokens [claude|codex] [current|all|path]',
     });
     this.register({
       name: 'context_health',
-      description: 'Check context window health from Claude JSONL usage records',
+      description: 'Check context window health from Claude or Codex usage records',
       aliases: ['ctxhealth', 'contexthealth'],
-      usage: '/context_health [current|all|path]',
+      usage: '/context_health [claude|codex] [current|all|path]',
     });
     this.register({
       name: 'noise_eval',
       description: 'Run evidence-first noise evaluation across outcome, process, context, and validation',
       aliases: ['noise'],
-      usage: '/noise_eval [current|all|path]',
+      usage: '/noise_eval [claude|codex] [current|all|path]',
     });
     this.register({
       name: 'context_noise',
       description: 'Legacy alias for the formal noise evaluation command',
       aliases: ['ctxnoise', 'contextnoise'],
-      usage: '/context_noise [current|all|path]',
+      usage: '/context_noise [claude|codex] [current|all|path]',
     });
     this.register({
       name: 'todo_granularity',
-      description: 'Analyze todo granularity against Claude context/token usage',
+      description: 'Analyze todo granularity against Claude or Codex context/token usage',
       aliases: ['todograin', 'todocontext'],
-      usage: '/todo_granularity [current|all|path]',
+      usage: '/todo_granularity [claude|codex] [current|all|path]',
     });
     this.register({
       name: 'projectcontext',

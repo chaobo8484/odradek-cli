@@ -1,5 +1,6 @@
 import path from 'path';
 import { Box, Text } from 'ink';
+import type { ReactNode } from 'react';
 
 type ContextHealthLevel = 'healthy' | 'elevated' | 'critical' | 'unknown';
 type ContextHealthConfidence = 'high' | 'medium' | 'low';
@@ -42,6 +43,7 @@ type ContextHealthSnapshot = {
 type ContextHealthScreenProps = {
   scopeLabel: string;
   sourceLabel: string;
+  selectedSource: 'claude' | 'codex';
   snapshot: ContextHealthSnapshot;
 };
 
@@ -53,6 +55,8 @@ type MetricCell = {
   note: string;
   tone?: Tone;
 };
+
+const USAGE_BAR_WIDTH = 24;
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat('en-US').format(Math.round(value));
@@ -76,6 +80,73 @@ function truncateMiddle(value: string, maxLength: number): string {
   return `${value.slice(0, head)}...${value.slice(value.length - tail)}`;
 }
 
+function chunk<T>(items: T[], size: number): T[][] {
+  if (size <= 0) {
+    return [items];
+  }
+
+  const rows: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    rows.push(items.slice(index, index + size));
+  }
+  return rows;
+}
+
+function buildSectionBorder(
+  title: string,
+  width: number,
+  note?: string
+): {
+  titleText: string;
+  noteText: string;
+  fill: string;
+  bottom: string;
+} {
+  const titleText = title.toUpperCase();
+  const noteText = note ? truncateMiddle(note, Math.max(12, Math.floor(width * 0.26))) : '';
+  const reservedWidth = 4 + titleText.length + (noteText ? noteText.length + 1 : 0);
+  const fill = '─'.repeat(Math.max(1, width - reservedWidth));
+  return {
+    titleText,
+    noteText,
+    fill,
+    bottom: `└${'─'.repeat(Math.max(1, width - 1))}`,
+  };
+}
+
+function SectionBlock({
+  title,
+  width,
+  note,
+  tone = 'gray',
+  children,
+  marginBottom = 1,
+}: {
+  title: string;
+  width: number;
+  note?: string;
+  tone?: Tone;
+  children: ReactNode;
+  marginBottom?: number;
+}) {
+  const border = buildSectionBorder(title, width, note);
+
+  return (
+    <Box flexDirection="column" marginBottom={marginBottom}>
+      <Box>
+        <Text color="gray">┌─ </Text>
+        <Text color={tone}>{border.titleText}</Text>
+        <Text color="gray"> {border.fill}</Text>
+        {border.noteText ? <Text color="gray"> {border.noteText}</Text> : null}
+      </Box>
+      <Box flexDirection="column" paddingLeft={1}>
+        {children}
+      </Box>
+      <Text color="gray">{border.bottom}</Text>
+    </Box>
+  );
+}
+
 function levelColor(level: ContextHealthLevel): Tone {
   if (level === 'critical') return 'red';
   if (level === 'elevated') return 'yellow';
@@ -89,10 +160,13 @@ function confidenceColor(confidence: ContextHealthConfidence): Tone {
   return 'red';
 }
 
-function renderBar(percent: number, color: Tone, width = 24): string {
+function renderBar(percent: number, width = USAGE_BAR_WIDTH): { filled: string; empty: string } {
   const normalized = Math.max(0, Math.min(100, percent));
   const filled = normalized > 0 ? Math.max(1, Math.round((normalized / 100) * width)) : 0;
-  return `${'\u2588'.repeat(filled)}${'\u2591'.repeat(Math.max(0, width - filled))}`;
+  return {
+    filled: '\u2588'.repeat(filled),
+    empty: '\u2591'.repeat(Math.max(0, width - filled)),
+  };
 }
 
 function formatAgeHours(timestampMs: number): number | null {
@@ -139,10 +213,6 @@ function formatTrend(delta: number | null): string {
   return '\u2192 0.0%';
 }
 
-function formatScope(scopeLabel: string): string {
-  return scopeLabel.trim().replace(/\s+/g, '_').toLowerCase();
-}
-
 function buildEvidenceLine(snapshot: ContextHealthSnapshot): string {
   const parts: string[] = [
     snapshot.source === 'native' ? 'native context usage' : 'derived from usage tokens only',
@@ -162,7 +232,7 @@ function buildEvidenceLine(snapshot: ContextHealthSnapshot): string {
     parts.push(`drift ${snapshot.percentDrift.toFixed(1)} pts`);
   }
 
-  return parts.join(' \u00b7 ');
+  return parts.join(' · ');
 }
 
 function buildMetricRows(snapshot: ContextHealthSnapshot): Array<{
@@ -206,14 +276,18 @@ function MetricRowView({
 }) {
   const percentValue = value === 'n/a' ? 0 : Number.parseFloat(value);
   const percentText = value === 'n/a' ? 'n/a' : value;
+  const bar = renderBar(percentValue);
 
   return (
     <Box>
       <Box width={12}>
         <Text color="gray">{label}</Text>
       </Box>
-      <Box width={20}>
-        <Text color={color}>{renderBar(percentValue, color)}</Text>
+      <Box width={USAGE_BAR_WIDTH}>
+        <Text>
+          <Text color={color}>{bar.filled}</Text>
+          <Text color="gray">{bar.empty}</Text>
+        </Text>
       </Box>
       <Box width={7} justifyContent="flex-end">
         <Text color={value === 'n/a' ? 'gray' : 'white'}>{percentText}</Text>
@@ -237,11 +311,17 @@ function CompactMetricCellView({ cell, width }: { cell: MetricCell; width: numbe
   );
 }
 
-export function ContextHealthScreen({ scopeLabel, sourceLabel, snapshot }: ContextHealthScreenProps) {
+export function ContextHealthScreen({
+  scopeLabel,
+  sourceLabel,
+  selectedSource,
+  snapshot,
+}: ContextHealthScreenProps) {
   const modelAccent = '#D6F54A';
   const terminalWidth = process.stdout.columns ?? 100;
-  const contentWidth = Math.max(68, terminalWidth - 4);
-  const rule = '\u2500'.repeat(contentWidth);
+  const contentWidth = Math.max(68, terminalWidth - 2);
+  const metricColumns = terminalWidth >= 120 ? 3 : terminalWidth >= 92 ? 2 : 1;
+  const metricCellWidth = Math.max(20, Math.floor((contentWidth - (metricColumns - 1) * 2) / metricColumns));
   const statusTone = levelColor(snapshot.level);
   const confidenceTone = confidenceColor(snapshot.confidence);
   const freshness = formatFreshness(snapshot);
@@ -263,6 +343,26 @@ export function ContextHealthScreen({ scopeLabel, sourceLabel, snapshot }: Conte
       label: 'buffer',
       value: formatNumber(snapshot.autocompactBufferTokens),
       note: `${Math.round((snapshot.autocompactBufferTokens / snapshot.contextWindowTokens) * 100)}% held back`,
+      tone: 'white',
+    },
+  ];
+  const middleCells: MetricCell[] = [
+    {
+      label: 'source',
+      value: snapshot.source,
+      note: snapshot.nativeSampleCount > 0 ? 'native+usage' : 'usage-only',
+      tone: 'white',
+    },
+    {
+      label: 'input',
+      value: formatNumber(snapshot.inputTokens),
+      note: 'request',
+      tone: 'white',
+    },
+    {
+      label: 'usable',
+      value: formatNumber(snapshot.usableContextTokens),
+      note: 'after reserve',
       tone: 'white',
     },
   ];
@@ -299,81 +399,72 @@ export function ContextHealthScreen({ scopeLabel, sourceLabel, snapshot }: Conte
     notes.push('native and usage-token estimates diverge materially');
   }
 
-  const headerLeft = `/context_health  ${formatScope(scopeLabel)}`;
-  const sourceLine = truncateMiddle(sourceLabel, Math.max(24, contentWidth));
-  const notesLine = notes.join(' \u00b7 ');
-  const cellWidth = Math.max(18, Math.floor((contentWidth - 4) / 3));
+  const tokenGroups = [topCells, middleCells, lowerCells];
+  const notesLine = notes.join(' · ');
+  const sourceLine = `scope ${scopeLabel} | source ${truncateMiddle(sourceLabel, 42)}`;
+  const commandLine = `/context_health ${selectedSource}`;
 
   return (
     <Box flexDirection="column" paddingX={1}>
-      <Box>
-        <Text color="white">{headerLeft}</Text>
+      <Box justifyContent="space-between">
+        <Text color="white">{commandLine}</Text>
+        <Text color="gray">odradek - context health</Text>
       </Box>
       <Text color="gray">{sourceLine}</Text>
-      <Text color="gray">{rule}</Text>
 
-      <Box>
-        <Text color={statusTone}>{'\u25cf'} </Text>
-        <Text color={statusTone}>{snapshot.level.toUpperCase()}</Text>
-        <Text color="white">  {snapshot.levelReason}</Text>
-        <Text color="gray">   [</Text>
-        <Text color={confidenceTone}>{snapshot.confidence.toUpperCase()}</Text>
-        <Text color="gray">]</Text>
-      </Box>
-      <Text color={modelAccent}>{truncateMiddle(snapshot.model || 'unknown', 32)}</Text>
-
-      <Text color="gray">{buildEvidenceLine(snapshot)}</Text>
-      {notesLine ? <Text color="yellow">! {notesLine}</Text> : null}
-      <Text color="gray">{rule}</Text>
-
-      <Text color="gray">USAGE</Text>
-      {usageRows.map((row) => (
-        <MetricRowView key={row.label} label={row.label} value={row.value} note={row.note} color={row.color} />
-      ))}
-
-      <Text color="gray">{rule}</Text>
-      <Text color="gray">TOKENS</Text>
-      <Box>
-        {topCells.map((cell, index) => (
-          <Box key={cell.label} marginRight={index < topCells.length - 1 ? 2 : 0}>
-            <CompactMetricCellView cell={cell} width={cellWidth} />
-          </Box>
-        ))}
-      </Box>
-
-      <Box>
-        <Box width={cellWidth} marginRight={2}>
-          <Text color="gray">source </Text>
-          <Text color="white">{snapshot.source}</Text>
-          <Text color="gray"> {snapshot.nativeSampleCount > 0 ? 'mixed' : 'usage-only'}</Text>
-        </Box>
-        <Box width={cellWidth} marginRight={2}>
-          <Text color="gray">input </Text>
-          <Text color="white">{formatNumber(snapshot.inputTokens)}</Text>
-          <Text color="gray"> request</Text>
-        </Box>
-        <Box width={cellWidth}>
-          <Text color="gray">usable </Text>
-          <Text color="white">{formatNumber(snapshot.usableContextTokens)}</Text>
-          <Text color="gray"> after reserve</Text>
-        </Box>
-      </Box>
-
-      <Box>
-        {lowerCells.map((cell, index) => (
-          <Box key={cell.label} marginRight={index < lowerCells.length - 1 ? 2 : 0}>
-            <CompactMetricCellView cell={cell} width={cellWidth} />
-          </Box>
-        ))}
-      </Box>
-
-      <Text color="gray">{rule}</Text>
-      <Box justifyContent="space-between">
-        <Text color="gray">
-          {sessionId}  {snapshot.timestampLabel}
+      <SectionBlock title="Summary" width={contentWidth} note={sessionId} tone={statusTone}>
+        <Text wrap="wrap">
+          <Text color={statusTone}>● {snapshot.level.toUpperCase()}</Text>
+          <Text color="white"> {snapshot.levelReason}</Text>
+          <Text color="gray"> [</Text>
+          <Text color={confidenceTone}>{snapshot.confidence.toUpperCase()}</Text>
+          <Text color="gray">]</Text>
         </Text>
-        <Text color={freshness.tone}>{freshness.label}</Text>
-      </Box>
+        <Text color={modelAccent} wrap="wrap">
+          {truncateMiddle(snapshot.model || 'unknown', Math.max(32, contentWidth - 2))}
+        </Text>
+        <Text color="gray" wrap="wrap">
+          {buildEvidenceLine(snapshot)}
+        </Text>
+        {notesLine ? (
+          <Text color="yellow" wrap="wrap">
+            ! {notesLine}
+          </Text>
+        ) : null}
+      </SectionBlock>
+
+      <SectionBlock title="Usage" width={contentWidth}>
+        {usageRows.map((row) => (
+          <MetricRowView key={row.label} label={row.label} value={row.value} note={row.note} color={row.color} />
+        ))}
+      </SectionBlock>
+
+      <SectionBlock title="Tokens" width={contentWidth}>
+        {tokenGroups.map((cells, groupIndex) => (
+          <Box key={`token-group-${groupIndex}`} flexDirection="column" marginBottom={groupIndex < tokenGroups.length - 1 ? 1 : 0}>
+            {chunk(cells, metricColumns).map((row, rowIndex) => (
+              <Box key={`token-row-${groupIndex}-${rowIndex}`}>
+                {row.map((cell, index) => (
+                  <Box key={`${groupIndex}-${cell.label}`} marginRight={index < row.length - 1 ? 2 : 0}>
+                    <CompactMetricCellView cell={cell} width={metricCellWidth} />
+                  </Box>
+                ))}
+              </Box>
+            ))}
+          </Box>
+        ))}
+      </SectionBlock>
+
+      <SectionBlock title="Snapshot" width={contentWidth} note={snapshot.timestampLabel} tone={freshness.tone} marginBottom={0}>
+        <Box>
+          <Box flexGrow={1} marginRight={1}>
+            <Text color="gray" wrap="truncate-end">
+              {snapshot.confidenceReason}
+            </Text>
+          </Box>
+          <Text color={freshness.tone}>{freshness.label}</Text>
+        </Box>
+      </SectionBlock>
     </Box>
   );
 }
