@@ -19,6 +19,7 @@ import { LLMClient } from '../llm/LLMClient.js';
 import { createDefaultAdapters } from '../llm/adapters/createDefaultAdapters.js';
 import { LLMAdapter } from '../llm/adapters/types.js';
 import { TrustDecision, TrustPrompt } from './ink/TrustPrompt.js';
+import { UpdateChecker, UpdateNotice } from './UpdateChecker.js';
 
 export class CLI {
   private static readonly EXIT_CONFIRM_WINDOW_MS = 3000;
@@ -44,10 +45,12 @@ export class CLI {
   private readonly homeSuccess = chalk.hex('#8CE36B');
   private readonly homeWarning = chalk.hex('#F0C35C');
   private readonly homeDanger = chalk.hex('#FF7A72');
-  private readonly internalBuildVersion = this.readPackageVersion();
+  private readonly packageMetadata = this.readPackageMetadata();
+  private readonly internalBuildVersion = this.packageMetadata.version;
   private configStore: ConfigStore;
   private llmClient: LLMClient;
   private readonly adaptersByProvider: Map<ProviderName, LLMAdapter>;
+  private readonly updateChecker: UpdateChecker;
   private isInteractiveCommandActive = false;
   private commandDataHistory: Array<{ timestamp: Date; command: string; data: string }> = [];
   private isLineProcessing = false;
@@ -56,6 +59,7 @@ export class CLI {
   private exitConfirmationNoticeVisible = false;
   private activeDetailPageContext: { command: string; dialogueTurns: number } | null = null;
   private isReturningFromDetailPage = false;
+  private currentUpdateNotice: UpdateNotice | null = null;
   private readonly onInputAssistKeypress = (str: string, key: readline.Key): void => {
     if (!(key.ctrl && key.name === 'c') && this.hasPendingExitConfirmation()) {
       this.clearPendingExitConfirmation(true);
@@ -161,6 +165,7 @@ export class CLI {
     this.conversationManager = new ConversationManager();
     this.uiRenderer = new UIRenderer(this.conversationManager);
     this.configStore = new ConfigStore();
+    this.updateChecker = new UpdateChecker(this.configStore, this.packageMetadata.name, this.packageMetadata.version);
     const adapters = createDefaultAdapters();
     this.adaptersByProvider = new Map(adapters.map((adapter) => [adapter.provider, adapter]));
     this.llmClient = new LLMClient(this.configStore, adapters, this.buildCommandDataContext.bind(this));
@@ -186,6 +191,7 @@ export class CLI {
       process.exit(0);
     }
 
+    await this.refreshUpdateNoticeForStartup();
     await this.showWelcome();
     this.setupReadline();
     this.applyBlockCursorStyle();
@@ -289,8 +295,8 @@ export class CLI {
   private buildHomeHeaderLine(width: number): string {
     const titleText = 'ODRADEK';
     const title = this.homeTitle.bold(titleText);
-    const buildText = `Internal build: ${this.internalBuildVersion}`;
-    const buildLabel = this.homeMuted(buildText);
+    const buildText = this.getHomeBuildText();
+    const buildLabel = this.renderHomeBuildLabel();
     const gapWidth = Math.max(1, width - this.getDisplayWidth(titleText) - this.getDisplayWidth(buildText));
     return `${title}${' '.repeat(gapWidth)}${buildLabel}`;
   }
@@ -387,16 +393,47 @@ export class CLI {
     });
   }
 
-  private readPackageVersion(): string {
+  private readPackageMetadata(): { name: string; version: string } {
     try {
       const currentFilePath = fileURLToPath(import.meta.url);
       const packageJsonPath = path.resolve(path.dirname(currentFilePath), '../../package.json');
       const raw = fs.readFileSync(packageJsonPath, 'utf-8');
-      const parsed = JSON.parse(raw) as { version?: unknown };
-      return typeof parsed.version === 'string' && parsed.version.trim() ? parsed.version.trim() : 'unknown';
+      const parsed = JSON.parse(raw) as { name?: unknown; version?: unknown };
+      return {
+        name: typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : 'odradek-cli',
+        version: typeof parsed.version === 'string' && parsed.version.trim() ? parsed.version.trim() : 'unknown',
+      };
     } catch {
-      return 'unknown';
+      return { name: 'odradek-cli', version: 'unknown' };
     }
+  }
+
+  private async refreshUpdateNoticeForStartup(): Promise<void> {
+    try {
+      this.currentUpdateNotice =
+        (await this.updateChecker.checkForUpdates(true)) ?? (await this.updateChecker.getCachedNotice());
+    } catch {
+      this.currentUpdateNotice = null;
+    }
+  }
+
+  private getHomeBuildText(): string {
+    if (!this.currentUpdateNotice) {
+      return `Internal build: ${this.internalBuildVersion}`;
+    }
+
+    return `Internal build: ${this.internalBuildVersion} --- ${this.currentUpdateNotice.latestVersion}(new)`;
+  }
+
+  private renderHomeBuildLabel(): string {
+    if (!this.currentUpdateNotice) {
+      return this.homeMuted(this.getHomeBuildText());
+    }
+
+    return (
+      this.homeMuted(`Internal build: ${this.internalBuildVersion} --- `) +
+      this.homeSuccess(`${this.currentUpdateNotice.latestVersion}(new)`)
+    );
   }
 
   private colorizeHomeValue(

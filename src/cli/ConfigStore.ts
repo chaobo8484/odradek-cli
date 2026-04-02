@@ -10,11 +10,17 @@ export interface ProviderConfig {
   model?: string;
 }
 
+export interface UpdateCheckState {
+  lastCheckedAt?: string;
+  latestVersion?: string;
+}
+
 export interface AppConfig {
   activeProvider: ProviderName;
   providers: Record<ProviderName, ProviderConfig>;
   trustedPaths: string[];
   projectContextEnabled: boolean;
+  updateCheck: UpdateCheckState;
 }
 
 export type ConfigValueSource = 'session' | 'env' | 'local' | 'default' | 'unset';
@@ -41,6 +47,7 @@ const DEFAULT_CONFIG: AppConfig = {
   },
   trustedPaths: [],
   projectContextEnabled: true,
+  updateCheck: {},
 };
 
 export class ConfigStore {
@@ -74,6 +81,7 @@ export class ConfigStore {
           typeof parsed.projectContextEnabled === 'boolean'
             ? parsed.projectContextEnabled
             : DEFAULT_CONFIG.projectContextEnabled,
+        updateCheck: this.normalizeUpdateCheckState(parsed.updateCheck),
       };
     } catch {
       return { ...DEFAULT_CONFIG };
@@ -174,6 +182,19 @@ export class ConfigStore {
 
   getConfigPath(): string {
     return this.configPath;
+  }
+
+  async getUpdateCheckState(): Promise<UpdateCheckState> {
+    const current = await this.getStoredConfig();
+    return current.updateCheck ?? {};
+  }
+
+  async setUpdateCheckState(updateCheck: UpdateCheckState): Promise<void> {
+    const current = await this.getStoredConfig();
+    await this.writeConfig({
+      ...current,
+      updateCheck: this.normalizeUpdateCheckState(updateCheck),
+    });
   }
 
   async setStoredProviderConfig(provider: ProviderName, config: ProviderConfig): Promise<void> {
@@ -350,6 +371,17 @@ export class ConfigStore {
       ...(this.normalizeOptionalString(config.apiKey) ? { apiKey: this.normalizeOptionalString(config.apiKey) } : {}),
       ...(this.normalizeOptionalString(config.baseUrl) ? { baseUrl: this.normalizeOptionalString(config.baseUrl) } : {}),
       ...(this.normalizeOptionalString(config.model) ? { model: this.normalizeOptionalString(config.model) } : {}),
+    };
+  }
+
+  private normalizeUpdateCheckState(state: UpdateCheckState | undefined): UpdateCheckState {
+    if (!state) {
+      return {};
+    }
+
+    return {
+      ...(this.normalizeOptionalString(state.lastCheckedAt) ? { lastCheckedAt: this.normalizeOptionalString(state.lastCheckedAt) } : {}),
+      ...(this.normalizeOptionalString(state.latestVersion) ? { latestVersion: this.normalizeOptionalString(state.latestVersion) } : {}),
     };
   }
 

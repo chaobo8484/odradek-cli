@@ -12,32 +12,55 @@
 
 </div>
 
-## Project Overview
+## Overview
 
-Odradek is a terminal-native CLI for Claude Code workflows, with support for more agent setups on the way. It brings interactive chat, provider switching, prompt and skill inspection, Claude JSONL diagnostics, and evidence-first noise evaluation into one workspace-aware tool.
+Odradek is a CLI tool for **diagnosing and enhancing Claude Code, Codex, and similar AI coding Agents**. It enables you to:
+
+- Chat with LLMs directly in the terminal while running diagnostics
+- Parse agent session logs to understand token structures and context pressure
+- Perform multi-dimensional noise evaluation to identify potential issues
+- Scan and inventory prompt assets, rules, and Skill documentation
+- Seamlessly switch between multiple providers (Claude / OpenRouter / Qwen)
 
 <img src="images/homepage.png" alt="Odradek Homepage">
 
-## Why Odradek
+## Core Features
 
-- Stay inside the terminal for both chat and workflow diagnostics.
-- Switch between Claude and OpenRouter in the same session with `/provider` and `/model`.
-- Inspect prompt, rules, agent, and skill assets before they quietly bloat your context window.
-- Parse Claude JSONL records to understand token structure and context pressure.
-- Run evidence-first noise evaluation across outcome, process, context, and validation.
-- Stay conservative when evidence is incomplete: return `N/A` instead of guessing.
+| Feature | Description |
+|---------|-------------|
+| **Multi-Provider Support** | Switch between Claude, OpenRouter, and Qwen seamlessly with `/provider` and `/model` |
+| **Layered System Prompts** | Multi-tier prompt configuration from app-level to workspace-level, covering base / provider / model layers |
+| **Evidence-first Noise Evaluation** | Four-dimensional noise analysis (outcome, process, context, validation) with confidence scores per signal |
+| **Token Structure Parsing** | Parse JSONL session logs with structured data on token field aggregates, role breakdowns, and tool-call distributions |
+| **Context Health Detection** | Monitor context window utilization and provide truncation warnings |
+| **Todo Granularity Analysis** | Analyze todo granularity scores, state transitions, and context usage to detect under/over-granular decomposition |
+| **Prompt Asset Scanning** | Auto-scan prompt files, rules, agent configs, and system-prompt assets in workspaces |
+| **Skill Documentation Inventory** | Scan `SKILL.md` and supporting resources (agents/scripts/references) with instruction token estimates |
+| **Project Context Injection** | Intelligently index workspace files and dynamically inject relevant context based on LLM queries |
+| **JSON Diagnostic Export** | Export diagnostic data (noise_eval / context_health / scan_tokens) to JSON for secondary analysis |
+
+## What "Codex Support" Means
+
+This project supports Codex in the diagnostic layer:
+
+- Runtime chat providers: `claude`, `openrouter`, `qwen`
+- Diagnostic session sources: `claude`, `codex`
+- Codex session data: reads rollout JSONL under `~/.codex/sessions`
+- Workspace awareness: `/state` can detect whether the current repo contains a `.codex` directory
+
+In other words, Odradek can analyze Codex sessions today, even though Codex is not yet a live chat provider inside the CLI.
 
 ## Preview
 
 <div align="center">
 <table>
 <tr>
-<td><img src="images/chat.png" alt="Preview 1" width="100%"/></td>
-<td><img src="images/chatwithllm.png" alt="Preview 2" width="100%"/></td>
+<td><img src="images/chat.png" alt="Chat view" width="100%"/></td>
+<td><img src="images/chatwithllm.png" alt="LLM chat view" width="100%"/></td>
 </tr>
 <tr>
-<td><img src="images/noiseeval.png" alt="Preview 3" width="100%"/></td>
-<td><img src="images/noiseeval1.png" alt="Preview 4" width="100%"/></td>
+<td><img src="images/noiseeval.png" alt="Noise evaluation view" width="100%"/></td>
+<td><img src="images/noiseeval1.png" alt="Noise evaluation details" width="100%"/></td>
 </tr>
 </table>
 </div>
@@ -46,19 +69,17 @@ Odradek is a terminal-native CLI for Claude Code workflows, with support for mor
 
 | Area | What it covers | Key commands |
 | --- | --- | --- |
-| Runtime control | Provider / model switching, trust checks, project-context toggle, workspace state | `/state`, `/provider`, `/model`, `/trustpath`, `/projectcontext` |
-| Prompt and skill assets | Prompt / rules / agent scan, rule extraction, skills overview, layered system prompts | `/scan_prompt`, `/rules`, `/skills` |
-| Session diagnostics | Token structure, context health, evidence-first noise evaluation, todo granularity | `/scan_tokens`, `/context_health`, `/noise_eval`, `/todo_granularity` |
-| Conversation tools | Help, history, collapse/expand, export | `/help`, `/history`, `/collapse`, `/expand`, `/export` |
+| **Runtime Control** | Active provider, model overrides, trust state, project-context toggle | `/state`, `/provider`, `/model`, `/trustpath`, `/trustcheck`, `/projectcontext` |
+| **Prompt and Rule Inspection** | Prompt assets, workspace rules, `SKILL.md` inventory | `/scan_prompt`, `/rules`, `/skills` |
+| **Session Diagnostics** | Token structure, context health, Evidence-first noise evaluation, todo granularity | `/scan_tokens`, `/context_health`, `/noise_eval`, `/todo_granularity` |
+| **Conversation Utilities** | History, collapse/expand, clear, export | `/history`, `/collapse`, `/expand`, `/clear`, `/export` |
 
 ## Requirements
 
 - Node.js `>= 20`
 - npm `>= 9`
 
-## Production Install
-
-If you are a regular user and just want to use Odradek, install and configure it like this.
+## Install
 
 Install globally:
 
@@ -67,21 +88,40 @@ npm install -g odradek-cli
 odradek
 ```
 
-Or run it once without installing globally:
+Or run it once:
 
 ```bash
 npx odradek-cli@latest
 ```
 
-## Production Configuration
+## Quick Start
 
-Odradek reads provider settings from environment variables. For an installed CLI, you can provide them in any of these places:
+1. Configure environment variables or a `.env` file for your provider
+2. Start the CLI with `odradek`
+3. Trust the current workspace when prompted
+4. Run diagnostic commands
 
-- App-level `.env` or `.env.local`
-- Workspace `.env` or `.env.local`
-- Shell environment variables
+```text
+/state                    # Check runtime status
+/provider                 # Confirm current provider
+/scan_tokens codex current  # Parse session token structure
+/noise_eval codex current   # Run Evidence-first noise evaluation
+```
 
-Recommended app-level paths:
+Swap `codex` for `claude` to analyze Claude logs instead.
+
+## Configuration
+
+Odradek loads configuration from:
+
+1. shell environment variables
+2. app-level `.env` / `.env.local`
+3. workspace `.env` / `.env.local` files from repo root down to the current directory
+4. local config file defaults
+
+Existing shell env vars win. Among `.env` files, the closer workspace file overrides broader defaults.
+
+Recommended app-level `.env` path:
 
 ```text
 Windows: %APPDATA%/odradek-cli/.env
@@ -89,9 +129,17 @@ macOS:   ~/Library/Application Support/odradek-cli/.env
 Linux:   ~/.config/odradek-cli/.env
 ```
 
-Workspace files load after the app-level directory, so repo-specific settings can override your defaults.
+Local config file path:
 
-Claude example:
+```text
+Windows: %APPDATA%/odradek-cli/config.json
+macOS:   ~/Library/Application Support/odradek-cli/config.json
+Linux:   ~/.config/odradek-cli/config.json
+```
+
+### Runtime Provider Examples
+
+Claude:
 
 ```env
 ODRADEK_ACTIVE_PROVIDER=claude
@@ -101,7 +149,7 @@ ODRADEK_CLAUDE_BASE_URL=https://api.anthropic.com/v1
 ODRADEK_PROJECT_CONTEXT_ENABLED=true
 ```
 
-OpenRouter example:
+OpenRouter:
 
 ```env
 ODRADEK_ACTIVE_PROVIDER=openrouter
@@ -111,7 +159,7 @@ ODRADEK_OPENROUTER_MODEL=provider/model-name
 ODRADEK_PROJECT_CONTEXT_ENABLED=true
 ```
 
-Qwen example:
+Qwen:
 
 ```env
 ODRADEK_ACTIVE_PROVIDER=qwen
@@ -121,62 +169,31 @@ ODRADEK_QWEN_MODEL=qwen3.5-plus
 ODRADEK_PROJECT_CONTEXT_ENABLED=true
 ```
 
-## First Run
-
-Start the installed CLI:
-
-```bash
-odradek
-```
-
-Recommended first commands:
-
-```text
-/state
-/provider
-/model
-/noise_eval current
-```
-
-On first launch, Odradek asks whether to trust the current working directory. After that, `.env`, `/provider`, and `/model` are usually enough to get the session ready.
-
-## Configuration Reference
-
-For installed usage, local development, CI/CD, and internal deployments, environment variables or a `.env` file are still the recommended setup.
-
-Windows config path:
-
-```text
-%APPDATA%/odradek-cli/config.json
-```
-
-Priority, highest first:
-
-1. Session model override set by `/model`
-2. Shell environment variables or `.env`
-3. Local config file and built-in defaults
-
-Environment variables:
+### Environment Variables
 
 | Variable | Purpose |
 | --- | --- |
-| `ODRADEK_ACTIVE_PROVIDER` | Active runtime provider, supports `claude` or `openrouter` |
+| `ODRADEK_ACTIVE_PROVIDER` | Active runtime provider: `claude`, `openrouter`, or `qwen` |
 | `ODRADEK_CLAUDE_API_KEY` | Claude API key |
-| `ODRADEK_CLAUDE_BASE_URL` | Claude-compatible API base URL |
+| `ODRADEK_CLAUDE_BASE_URL` | Claude-compatible base URL |
 | `ODRADEK_CLAUDE_MODEL` | Default Claude model |
 | `ODRADEK_OPENROUTER_API_KEY` | OpenRouter API key |
-| `ODRADEK_OPENROUTER_BASE_URL` | OpenRouter API base URL |
+| `ODRADEK_OPENROUTER_BASE_URL` | OpenRouter base URL |
 | `ODRADEK_OPENROUTER_MODEL` | Default OpenRouter model |
+| `ODRADEK_QWEN_API_KEY` | DashScope API key |
+| `ODRADEK_QWEN_BASE_URL` | Qwen compatible-mode base URL |
+| `ODRADEK_QWEN_MODEL` | Default Qwen model |
 | `ODRADEK_PROJECT_CONTEXT_ENABLED` | Enable or disable automatic project-context injection |
-| `ANTHROPIC_API_KEY` | Fallback Claude-compatible key name |
-| `ANTHROPIC_BASE_URL` | Fallback Claude-compatible base URL |
-| `OPENROUTER_API_KEY` | Fallback OpenRouter key name |
+| `ANTHROPIC_API_KEY` | Fallback Claude API key name |
+| `ANTHROPIC_BASE_URL` | Fallback Claude base URL name |
+| `OPENROUTER_API_KEY` | Fallback OpenRouter API key name |
+| `DASHSCOPE_API_KEY` | Fallback Qwen API key name |
 
 ## Layered System Prompts
 
-Odradek automatically loads layered system prompts before each model request.
+Odradek can assemble layered system prompts before each model request.
 
-Workspace prompt file paths:
+Workspace prompt paths:
 
 ```text
 .odradek/system-prompts/base.md
@@ -184,38 +201,96 @@ Workspace prompt file paths:
 .odradek/system-prompts/models/<model>.md
 ```
 
-For example:
-
-```text
-.odradek/system-prompts/providers/claude.md
-.odradek/system-prompts/models/claude-sonnet-4-6.md
-```
-
-Load order:
-
-1. `base.md`
-2. `providers/<provider>.md`
-3. `models/<model>.md`
-
-Odradek also supports an app-level prompt directory next to the config directory:
+App-level prompt path:
 
 ```text
 %APPDATA%/odradek-cli/system-prompts/
 ```
 
-Workspace prompts load after app-level prompts, so you can fine-tune behavior for a specific repo without changing your global defaults.
+Load order:
+
+1. app-level `base.md`
+2. app-level `providers/<provider>.md`
+3. app-level `models/<model>.md`
+4. workspace `.odradek/system-prompts/base.md`
+5. workspace `.odradek/system-prompts/providers/<provider>.md`
+6. workspace `.odradek/system-prompts/models/<model>.md`
+
+## Commands
+
+### Runtime and workspace
+
+| Command | Description |
+| --- | --- |
+| `/help` | Show all available commands |
+| `/state` | Show runtime, workspace, config, and trust status |
+| `/provider [claude\|openrouter\|qwen]` | Switch the active runtime provider |
+| `/model [model-name\|clear]` | Set or clear the session model override |
+| `/projectcontext [on\|off\|status]` | Control project-context injection |
+| `/trustpath` | Trust the current working directory |
+| `/trustcheck` | Check whether the current directory is trusted |
+
+### Prompt and workspace inspection
+
+| Command | Description |
+| --- | --- |
+| `/scan_prompt` | Scan prompt, rules, agent, and system-prompt assets in the workspace |
+| `/rules [path]` | Extract explicit rule and instruction lines from a workspace |
+| `/skills [path]` | Scan local `SKILL.md` files and supporting resources |
+
+### Claude and Codex diagnostics
+
+These commands support the source prefix `claude` or `codex`:
+
+| Command | Description |
+| --- | --- |
+| `/scan_tokens [claude\|codex] [current\|all\|path]` | Parse session JSONL token structures |
+| `/context_health [claude\|codex] [current\|all\|path]` | Inspect context-window health |
+| `/noise_eval [claude\|codex] [current\|all\|path]` | Run evidence-first noise evaluation |
+| `/context_noise [claude\|codex] [current\|all\|path]` | Alias for `/noise_eval` |
+| `/todo_granularity [claude\|codex] [current\|all\|path]` | Analyze todo granularity against session context usage |
+
+Useful examples:
+
+```text
+/scan_tokens codex current
+/context_health codex all
+/noise_eval claude current
+/todo_granularity codex current
+```
+
+### Conversation and export
+
+| Command | Description |
+| --- | --- |
+| `/history` | Show all conversation messages |
+| `/collapse [id\|all]` | Collapse messages |
+| `/expand [id\|all]` | Expand messages |
+| `/clear` | Clear conversation history |
+| `/analyze` | Show a simple conversation count summary |
+| `/export [claude\|codex] [state\|noise_eval\|context_health\|scan_tokens\|rules\|skills\|scan_prompt\|todo_granularity\|all]` | Export diagnostic datasets to JSON |
+| `/exit` or `/quit` | Exit the CLI |
+
+Exports are written to:
+
+```text
+.odradek/exports/
+```
+
+Example:
+
+```text
+/export codex all
+/export claude noise_eval
+```
 
 ## Development
-
-Use this path only if you want to modify the source, test unreleased changes, or contribute to the project.
-
-1. Install dependencies
 
 ```bash
 npm install
 ```
 
-2. Copy the environment template
+Copy the env template:
 
 ```bash
 cp .env.example .env
@@ -227,27 +302,27 @@ PowerShell:
 Copy-Item .env.example .env
 ```
 
-3. Start the development CLI
+Run the dev CLI:
 
 ```bash
 npm run dev
 ```
 
-4. Build and run the distributable CLI locally
+Build and run the compiled version:
 
 ```bash
 npm run build
 npm start
 ```
 
-5. Optionally test the global command name against your local checkout
+Optional local link:
 
 ```bash
 npm link
 odradek
 ```
 
-If you want to switch back from your local linked build to the published package:
+Undo the global link:
 
 ```bash
 npm unlink -g odradek-cli
@@ -256,103 +331,59 @@ npm unlink -g odradek-cli
 Core scripts:
 
 ```bash
-npm run dev    # start the development CLI
-npm run build  # compile TypeScript to dist/
-npm start      # run the built version
+npm run dev
+npm run build
+npm start
 ```
-
-## Common Commands
-
-| Command | Description |
-| --- | --- |
-| `/help` | Show all available commands |
-| `/state` | Show workspace, runtime, config, and trust status |
-| `/provider [claude\|openrouter\|qwen]` | Switch the active provider |
-| `/model [model-name\|clear]` | Switch or clear the current session model override |
-| `/trustpath` | Trust the current working directory |
-| `/trustcheck` | Check whether the current directory is already trusted |
-| `/projectcontext [on\|off\|status]` | Control or inspect project-context injection |
-| `/skills [path]` | Scan local `SKILL.md` files and show a skills overview |
-| `/scan_prompt` | Scan prompt, rules, and agent assets in the project |
-| `/rules [path]` | Extract explicit rules and instructions from a workspace |
-| `/scan_tokens [current\|all\|path]` | Parse Claude JSONL token structures |
-| `/context_health [current\|all\|path]` | Inspect context-window health from JSONL records |
-| `/noise_eval [current\|all\|path]` | Run evidence-first noise evaluation |
-| `/context_noise [current\|all\|path]` | Compatibility alias for `/noise_eval` |
-| `/todo_granularity [current\|all\|path]` | Analyze todo granularity against context load |
-| `/history` | Show all conversation messages |
-| `/collapse [id\|all]` | Collapse history messages |
-| `/expand [id\|all]` | Expand history messages |
-| `/export [filename]` | Export conversation history |
-| `/exit` or `/quit` | Exit the CLI |
 
 ## Project Layout
 
 ```text
 src/
-|- cli/
-|- config/
-|- llm/
-`- index.ts
+|- cli/                    # CLI core: command registry, handlers, session management
+|   |- ink/                # Ink terminal UI components
+|   |- ClaudeTranscriptParser.ts   # Claude/Codex session parser
+|   |- NoiseEvaluator.ts            # Evidence-first noise evaluation engine
+|   |- ContextNoiseAnalyzer.ts      # Context noise analysis
+|   |- PromptAssetScanner.ts       # Prompt asset scanner
+|   |- RuleScanner.ts              # Rule extractor
+|   |- SkillScanner.ts             # SKILL.md inventory
+|   |- TodoGranularityAnalyzer.ts   # Todo granularity analysis
+|   |- ConversationManager.ts       # Conversation history management
+|   |- ConfigStore.ts              # Configuration storage
+|   `- tokenEstimate.ts            # Token estimation
+|- config/                  # Config loading, Provider catalog
+|- llm/                     # LLM adapter layer: multi-provider support
+|   |- adapters/             # Claude / OpenRouter / Qwen adapters
+|   |- LLMClient.ts         # LLM client
+|   |- ProjectContextBuilder.ts    # Project context injection
+|   `- PersistentProjectIndex.ts   # Persistent project index
+`- index.ts                 # CLI entry point
 ```
 
-## Release Workflow
-
-If you are a contributor preparing a new npm release, follow this path.
-
-1. Build the release package
+## Release
 
 ```bash
 npm run build
-```
-
-2. Inspect the final published contents
-
-```bash
 npm pack --dry-run
-```
-
-3. Publish to npm
-
-```bash
 npm publish
 ```
 
-If you are publishing a scoped public package, use:
+For a scoped public package:
 
 ```bash
 npm publish --access public
 ```
 
-4. Verify the production install path
-
-```bash
-npx odradek-cli@latest
-```
-
-## Pre-release Checklist
-
-```bash
-npm run build
-npm pack --dry-run
-```
-
-Before publishing, make sure that:
-
-- You do not commit `.env`
-- `dist/` has been generated
-- API keys are injected only through environment variables
-- `npm pack --dry-run` includes only the intended files
-
 ## Report Bugs
 
-You can submit bugs, questions, and suggestions through [GitHub Issues](https://github.com/chaobo8484/odradek-cli/issues).
+Issues and suggestions are welcome in [GitHub Issues](https://github.com/chaobo8484/odradek-cli/issues).
 
 ## About
 
-As an independent developer, I welcome technical discussions, project collaboration, and career opportunities. You can reach me here:
+As an independent developer, I welcome technical discussion, collaboration, and career opportunities.
 
-| Contact | Address |
+| Contact | Address | 
 | --- | --- |
 | Email | stratospherelabs@protonmail.com |
 | Email | chaobo_pro at outlook dot com |

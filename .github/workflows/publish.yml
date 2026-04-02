@@ -3,14 +3,47 @@ name: Publish Package to npmjs
 on:
   push:
     branches:
-      - main # 当你向 main 分支推送代码时触发
-  # 推荐做法：也可以改为在 GitHub 创建 Release 时触发
-  # release:
-  #   types: [created]
+      - main
+  release:
+    types:
+      - published
+  workflow_dispatch:
 
 jobs:
   build:
+    name: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Verify publishable package contents
+        run: npm pack --dry-run
+
+  publish:
+    name: publish
+    needs: build
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -20,12 +53,22 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
+          cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build TypeScript
         run: npm run build
+
+      - name: Check npm token
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::Missing NPM_TOKEN secret. Add it in GitHub repository secrets before publishing."
+            exit 1
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish to npm
         run: npm publish --access public
