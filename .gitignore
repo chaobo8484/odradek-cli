@@ -10,3 +10,4 @@ docs/
 AGENTS.md
 tasks/
 .npmrc
+.odradek/exports/

@@ -66,6 +66,7 @@ type StateScreenProps = {
     hasEnvExample: boolean;
     hasWorkspaceClaude: boolean;
     hasWorkspaceCodex: boolean;
+    hasWorkspaceCursor: boolean;
     hasAgentsFile: boolean;
     hasClaudeFile: boolean;
     hasOdradekDir: boolean;
@@ -432,6 +433,7 @@ export function StateScreen(props: StateScreenProps) {
     yesNoDetail('CLAUDE.md', props.project.hasClaudeFile, 'root claude file'),
     yesNoDetail('workspace .claude', props.project.hasWorkspaceClaude, 'project-local claude directory'),
     yesNoDetail('workspace .codex', props.project.hasWorkspaceCodex, 'project-local codex directory'),
+    yesNoDetail('workspace .cursor', props.project.hasWorkspaceCursor, 'project-local cursor directory'),
     yesNoDetail('.odradek', props.project.hasOdradekDir, 'workspace odradek directory'),
     {
       label: 'prompt assets',

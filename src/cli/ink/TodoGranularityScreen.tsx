@@ -5,7 +5,7 @@ import type { TodoGranularityAnalysis, TodoGranularityBucket, TodoGranularitySug
 type TodoGranularityScreenProps = {
   scopeLabel: string;
   sourceLabel: string;
-  selectedSource: 'claude' | 'codex';
+  selectedSource: 'claude' | 'codex' | 'cursor';
   analysis: TodoGranularityAnalysis;
 };
 

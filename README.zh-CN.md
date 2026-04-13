@@ -11,6 +11,9 @@
 [English](README.md) | **简体中文**
 
 </div>
+## 前言
+
+本项目非常欢迎 Vibe Coding 开发者加入并共同建设。目前项目仍处于早期阶段，难免存在诸多不足，诚挚邀请各位贡献代码、反馈问题，与我们一同完善它。
 
 ## 项目简介
 
@@ -38,6 +41,7 @@ Odradek 是一款专为 **Claude Code、Codex 等 AI 编码 Agent** 打造的诊
 | **Skill 文档盘点** | 扫描 `SKILL.md` 及其配套资源（agents/scripts/references 等），评估指令 Token 规模 |
 | **项目上下文注入** | 智能索引工作区文件，基于 LLM 查询动态注入相关上下文，降低上下文噪声 |
 | **JSON 诊断导出** | 将诊断数据（noise_eval / context_health / scan_tokens 等）导出为 JSON 便于二次分析 |
+| **成本估算** | 基于 OpenRouter 定价实时估算 Claude/Codex 模型费用，提供可视化分解和场景建模 |
 
 ## 预览
 
@@ -61,6 +65,7 @@ Odradek 是一款专为 **Claude Code、Codex 等 AI 编码 Agent** 打造的诊
 | **运行态控制** | Provider、模型覆盖、信任状态、项目上下文开关 | `/state`、`/provider`、`/model`、`/trustpath`、`/trustcheck`、`/projectcontext` |
 | **Prompt 与规则检查** | Prompt 资产扫描、规则提取、`SKILL.md` 盘点 | `/scan_prompt`、`/rules`、`/skills` |
 | **会话诊断** | Token 结构、上下文健康度、Evidence-first 噪声评估、Todo 粒度分析 | `/scan_tokens`、`/context_health`、`/noise_eval`、`/todo_granularity` |
+| **成本估算** | 基于 OpenRouter 定价实时估算模型费用，提供可视化分解和场景建模 | `/cost` |
 | **对话工具** | 历史记录、折叠展开、清空、导出 | `/history`、`/collapse`、`/expand`、`/clear`、`/export` |
 
 ## 环境要求
@@ -247,6 +252,27 @@ Odradek 会在发起模型请求前按层加载 System Prompt。
 /noise_eval claude current
 /todo_granularity codex current
 ```
+
+### 成本估算
+
+| 命令 | 说明 |
+| --- | --- |
+| `/cost [claude\|codex]` | 基于 OpenRouter 定价估算 Claude 或 Codex/GPT 模型费用 |
+
+`/cost` 命令通过以下方式提供实时成本估算：
+- 从 OpenRouter 模型目录获取实时定价数据
+- 扫描当前工作区 Prompt 资产以计算总输入 Token 数
+- 建模多种成本场景（冷启动、缓存命中、与输出组合）
+- 显示缓存适配 Token 与动态 Token 的可视化分解
+
+常见示例：
+
+```text
+/cost claude    # 估算 Claude 系列模型费用
+/cost codex     # 估算 Codex/GPT 系列模型费用
+```
+
+> **注意**：`/cost cursor` 故意不支持，因为 Cursor 模型定价未公开。
 
 ### 对话与导出
 

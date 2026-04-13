@@ -130,8 +130,8 @@ export class PromptAssetScanner {
       }
     }
 
-    // Recognize files inside .claude/ directory as project-config (Claude Code convention).
-    if (directorySegments.some((segment) => segment.toLowerCase() === '.claude')) {
+    // Recognize files inside .claude/ and .cursor/ directories as project-config.
+    if (directorySegments.some((segment) => segment.toLowerCase() === '.claude' || segment.toLowerCase() === '.cursor')) {
       categories.push('project-config');
     }
 
@@ -139,7 +139,11 @@ export class PromptAssetScanner {
       categories.push('prompt-file');
     }
 
-    if (directorySegments.some((segment) => segment.toLowerCase() === 'rules')) {
+    if (
+      directorySegments.some((segment) => segment.toLowerCase() === 'rules') ||
+      fileNameLower === '.cursorrules' ||
+      (fileNameLower.endsWith('.mdc') && directorySegments.some((segment) => segment.toLowerCase() === '.cursor'))
+    ) {
       categories.push('rules');
     }
 

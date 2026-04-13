@@ -26,10 +26,14 @@ import { RulesScanScreen } from './ink/RulesScanScreen.js';
 import { SkillsOverviewScreen } from './ink/SkillsOverviewScreen.js';
 import { StateScreen } from './ink/StateScreen.js';
 import { TodoGranularityScreen } from './ink/TodoGranularityScreen.js';
+import { CostEstimateScreen } from './ink/CostEstimateScreen.js';
 import { TokenStructureScreen } from './ink/TokenStructureScreen.js';
+import { TokenUsageScreen } from './ink/TokenUsageScreen.js';
 import { renderStaticInkScreen } from './ink/renderInkScreen.js';
 import { ClaudeTokenizer } from '../llm/ClaudeTokenizer.js';
-import { getProviderMeta } from '../config/providerCatalog.js';
+import { OpenRouterModelCatalog, OpenRouterModelCatalogEntry, OpenRouterModelMatch } from '../llm/OpenRouterModelCatalog.js';
+import { TiktokenTokenizer } from '../llm/TiktokenTokenizer.js';
+import { getProviderMeta, ProviderName } from '../config/providerCatalog.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -76,7 +80,7 @@ type AnatomyBucket = {
 };
 
 type TokenScanScope = 'current' | 'all' | 'path';
-type TokenScanSource = 'claude' | 'codex';
+type TokenScanSource = 'claude' | 'codex' | 'cursor';
 
 type TokenScanRequest = {
   source: TokenScanSource;
@@ -136,6 +140,61 @@ type TokenScanTarget = {
   filePaths: string[];
 };
 
+type CostEstimateSegmentKey =
+  | 'system'
+  | 'prompt_library'
+  | 'reference_docs'
+  | 'chat_history'
+  | 'active_request';
+
+type CostEstimateSegment = {
+  key: CostEstimateSegmentKey;
+  label: string;
+  tokenCount: number;
+  cacheEligible: boolean;
+};
+
+type CostEstimateRateCard = {
+  prompt: number | null;
+  completion: number | null;
+  request: number | null;
+  inputCacheRead: number | null;
+  inputCacheWrite: number | null;
+};
+
+type CostEstimateScenario = {
+  label: string;
+  inputCostUsd: number;
+  outputExampleCostUsd: number;
+  totalWithOutputExampleUsd: number;
+  savingsVsColdUsd: number;
+  note: string;
+};
+
+type CostEstimateFamily = 'codex' | 'claude' | 'cursor';
+
+type CostEstimateVariant = {
+  label: string;
+  resolvedMatch: OpenRouterModelMatch;
+  rates: CostEstimateRateCard;
+  scenarios: CostEstimateScenario[];
+};
+
+type CostEstimatePresentation = {
+  targetFamily: CostEstimateFamily;
+  targetLabel: string;
+  provider: ProviderName;
+  providerLabel: string;
+  activeModel: string;
+  totalInputTokens: number;
+  cacheEligibleTokens: number;
+  dynamicTokens: number;
+  outputExampleTokens: number;
+  segments: CostEstimateSegment[];
+  variants: CostEstimateVariant[];
+  assumptions: string[];
+};
+
 type ContextHealthLevel = 'healthy' | 'elevated' | 'critical' | 'unknown';
 type ContextHealthConfidence = 'high' | 'medium' | 'low';
 
@@ -147,8 +206,68 @@ type ContextUsageRecord = {
   contextUsedPercent: number | null;
   contextWindowTokens: number | null;
   inputTokens: number;
+  outputTokens: number;
   cacheCreationTokens: number;
   cacheReadTokens: number;
+  totalTokens: number;
+};
+
+type TokenUsageWindowSummary = {
+  label: string;
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  records: number;
+  activeDays: number;
+};
+
+type TokenUsageModelDayValue = {
+  model: string;
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+};
+
+type TokenUsageDayAggregate = {
+  day: string;
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  records: number;
+  models: TokenUsageModelDayValue[];
+};
+
+type TokenUsageModelAggregate = {
+  model: string;
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  records: number;
+  activeDays: number;
+};
+
+type TokenUsageSummary = {
+  totalFiles: number;
+  totalRecords: number;
+  totalDays: number;
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  latestTimestampMs: number;
+  models: TokenUsageModelAggregate[];
+  days: TokenUsageDayAggregate[];
+  chartDays: TokenUsageDayAggregate[];
+  windows: TokenUsageWindowSummary[];
 };
 
 type ContextUsageMetrics = {
@@ -281,6 +400,7 @@ type StateProjectAssetSummary = {
   hasEnvExample: boolean;
   hasWorkspaceClaude: boolean;
   hasWorkspaceCodex: boolean;
+  hasWorkspaceCursor: boolean;
   hasAgentsFile: boolean;
   hasClaudeFile: boolean;
   hasOdradekDir: boolean;
@@ -410,6 +530,7 @@ export class CommandHandler {
   private static readonly CONTEXT_HEALTH_RECENT_RECORDS = 8;
   private static readonly CONTEXT_HEALTH_MAX_RECORDS_PER_FILE = 3;
   private static readonly SCAN_PROMPT_TIMEOUT_MS = 5 * 60 * 1000;
+  private static readonly COST_ESTIMATE_OUTPUT_EXAMPLE_TOKENS = 800;
   private readonly COMMAND_HINT_COLOR = chalk.hex('#D6F54A');
   private conversationManager: ConversationManager;
   private uiRenderer: UIRenderer;
@@ -421,12 +542,17 @@ export class CommandHandler {
   private onProjectContextControl: (args: string[]) => Promise<void>;
   private onTrustCurrentPath: () => Promise<void>;
   private onTrustCheckCurrentPath: () => Promise<void>;
+  private onNavigateBack: () => Promise<void>;
+  private onNavigateHome: () => Promise<void>;
+  private onOpenMenu: () => Promise<void>;
   private promptAssetScanner: PromptAssetScanner;
   private ruleScanner: RuleScanner;
   private skillScanner: SkillScanner;
   private contextNoiseAnalyzer: ContextNoiseAnalyzer;
   private noiseEvaluator: NoiseEvaluator;
   private claudeTokenizer: ClaudeTokenizer;
+  private tiktokenTokenizer: TiktokenTokenizer;
+  private openRouterModelCatalog: OpenRouterModelCatalog;
 
   constructor(
     conversationManager: ConversationManager,
@@ -437,7 +563,10 @@ export class CommandHandler {
     onCommandDataGenerated: (command: string, data: string) => void,
     onProjectContextControl: (args: string[]) => Promise<void>,
     onTrustCurrentPath: () => Promise<void>,
-    onTrustCheckCurrentPath: () => Promise<void>
+    onTrustCheckCurrentPath: () => Promise<void>,
+    onNavigateBack: () => Promise<void>,
+    onNavigateHome: () => Promise<void>,
+    onOpenMenu: () => Promise<void>
   ) {
     this.conversationManager = conversationManager;
     this.uiRenderer = uiRenderer;
@@ -448,6 +577,9 @@ export class CommandHandler {
     this.onProjectContextControl = onProjectContextControl;
     this.onTrustCurrentPath = onTrustCurrentPath;
     this.onTrustCheckCurrentPath = onTrustCheckCurrentPath;
+    this.onNavigateBack = onNavigateBack;
+    this.onNavigateHome = onNavigateHome;
+    this.onOpenMenu = onOpenMenu;
     this.promptAssetScanner = new PromptAssetScanner();
     this.ruleScanner = new RuleScanner();
     this.skillScanner = new SkillScanner();
@@ -455,6 +587,8 @@ export class CommandHandler {
     this.noiseEvaluator = new NoiseEvaluator();
     this.configStore = new ConfigStore();
     this.claudeTokenizer = new ClaudeTokenizer(this.configStore);
+    this.tiktokenTokenizer = new TiktokenTokenizer();
+    this.openRouterModelCatalog = new OpenRouterModelCatalog();
   }
 
   async handleCommand(input: string): Promise<void> {
@@ -466,22 +600,34 @@ export class CommandHandler {
       return;
     }
 
-    let resolvedCommand = normalizedCommand;
-    if (!this.commandRegistry.getCommand(resolvedCommand)) {
-      const prefixMatches = this.commandRegistry.findCommandsByPrefix(resolvedCommand);
-      if (prefixMatches.length === 1) {
-        resolvedCommand = prefixMatches[0].name;
-      } else if (prefixMatches.length > 1) {
-        const list = prefixMatches.slice(0, 6).map((cmd) => `/${cmd.name}`).join(', ');
-        this.uiRenderer.renderInfo(`Matched multiple commands: ${list}`);
-        this.uiRenderer.renderInfo('Continue typing to narrow down the command');
-        return;
-      }
+    const resolution = this.commandRegistry.resolveCommand(normalizedCommand);
+    if (resolution.status === 'ambiguous') {
+      const list = resolution.matches.slice(0, 6).map((cmd) => `/${cmd.name}`).join(', ');
+      this.uiRenderer.renderInfo(`Matched multiple commands: ${list}`);
+      this.uiRenderer.renderInfo('Continue typing to narrow down the command');
+      return;
     }
+
+    if (resolution.status === 'unknown') {
+      this.uiRenderer.renderError(`Unknown command: ${command}`);
+      this.uiRenderer.renderInfo('Type /help to see available commands');
+      return;
+    }
+
+    const resolvedCommand = resolution.command.name;
 
     switch (resolvedCommand) {
       case 'help':
         this.showHelp();
+        break;
+      case 'menu':
+        await this.onOpenMenu();
+        break;
+      case 'back':
+        await this.onNavigateBack();
+        break;
+      case 'home':
+        await this.onNavigateHome();
         break;
       case 'state':
         await this.showProjectState();
@@ -545,6 +691,16 @@ export class CommandHandler {
       case 'tokenscan':
         await this.scanTokenStructures(args);
         break;
+      case 'token_usage':
+      case 'tokenusage':
+      case 'usage_tokens':
+        await this.showTokenUsage(args);
+        break;
+      case 'cost':
+      case 'pricing':
+      case 'estimate_cost':
+        await this.showCurrentCostEstimate(args);
+        break;
       case 'context_health':
       case 'ctxhealth':
       case 'contexthealth':
@@ -562,9 +718,6 @@ export class CommandHandler {
       case 'todocontext':
         await this.analyzeTodoGranularity(args);
         break;
-      default:
-        this.uiRenderer.renderError(`Unknown command: ${command}`);
-        this.uiRenderer.renderInfo('Type /help to see available commands');
     }
   }
 
@@ -572,14 +725,18 @@ export class CommandHandler {
     console.log('');
     console.log(chalk.bold('  Available Commands'));
 
+    const categories = this.commandRegistry.getCommandCategories();
     const commands = this.commandRegistry.getAllCommands();
-    commands.forEach((cmd) => {
-      const usage = cmd.usage || `/${cmd.name}`;
-      console.log(chalk.dim('  - ') + this.COMMAND_HINT_COLOR(usage) + chalk.dim('  ') + chalk.gray(cmd.description));
+    categories.forEach((category) => {
+      console.log(chalk.dim(`  ${category}`));
+      this.commandRegistry.getCommandsByCategory(category).forEach((cmd) => {
+        const usage = cmd.usage || `/${cmd.name}`;
+        console.log(chalk.dim('  - ') + this.COMMAND_HINT_COLOR(usage) + chalk.dim('  ') + chalk.gray(cmd.description));
+      });
+      console.log('');
     });
 
-    console.log('');
-    console.log(chalk.dim('  Tip: type / and press Tab to autocomplete commands'));
+    console.log(chalk.dim('  Tip: type / and press Tab to autocomplete commands, or run /menu for the interactive menu'));
     console.log('');
     this.recordCommandData('help', `Listed ${commands.length} commands.`);
   }
@@ -763,6 +920,7 @@ export class CommandHandler {
           `skills=${projectSummary.skillCount}`,
           `workspaceClaude=${projectSummary.hasWorkspaceClaude}`,
           `workspaceCodex=${projectSummary.hasWorkspaceCodex}`,
+          `workspaceCursor=${projectSummary.hasWorkspaceCursor}`,
           `odradekDir=${projectSummary.hasOdradekDir}`,
         ].join('\n')
       );
@@ -877,6 +1035,7 @@ export class CommandHandler {
       hasEnvExample,
       hasWorkspaceClaude,
       hasWorkspaceCodex,
+      hasWorkspaceCursor,
       hasAgentsFile,
       hasClaudeFile,
       hasOdradekDir,
@@ -896,6 +1055,7 @@ export class CommandHandler {
       this.hasAnyRootFile(resolvedWorkspace, ['.env.example', '.env.sample', '.env.template', '.env.local.example']),
       this.isDirectory(path.join(resolvedWorkspace, '.claude')),
       this.isDirectory(path.join(resolvedWorkspace, '.codex')),
+      this.isDirectory(path.join(resolvedWorkspace, '.cursor')),
       this.hasAnyRootFile(resolvedWorkspace, ['AGENTS.md']),
       this.hasAnyRootFile(resolvedWorkspace, ['CLAUDE.md']),
       this.isDirectory(path.join(resolvedWorkspace, '.odradek')),
@@ -976,6 +1136,7 @@ export class CommandHandler {
       hasEnvExample,
       hasWorkspaceClaude,
       hasWorkspaceCodex,
+      hasWorkspaceCursor,
       hasAgentsFile,
       hasClaudeFile,
       hasOdradekDir,
@@ -1220,11 +1381,11 @@ export class CommandHandler {
     }
 
     if (input && input.trim()) {
-      throw new Error('Invalid source. Usage: /export [claude|codex]');
+      throw new Error('Invalid source. Usage: /export [claude|codex|cursor]');
     }
 
     if (!process.stdout.isTTY) {
-      throw new Error('Missing source. Usage: /export [claude|codex]');
+      throw new Error('Missing source. Usage: /export [claude|codex|cursor]');
     }
 
     const { selectedSource } = await inquirer.prompt<{ selectedSource: TokenScanSource }>([
@@ -1235,6 +1396,7 @@ export class CommandHandler {
         choices: [
           { name: 'Claude', value: 'claude' },
           { name: 'Codex', value: 'codex' },
+          { name: 'Cursor', value: 'cursor' },
         ],
       },
     ]);
@@ -1249,6 +1411,9 @@ export class CommandHandler {
     }
     if (normalized === 'codex') {
       return 'codex';
+    }
+    if (normalized === 'cursor') {
+      return 'cursor';
     }
     return null;
   }
@@ -1700,6 +1865,601 @@ export class CommandHandler {
       }
       this.recordCommandData('scan_tokens', `failed: ${message}`);
     }
+  }
+
+  private async showTokenUsage(args: string[]): Promise<void> {
+    const request = this.parseTokenScanRequest(args);
+    const spinner = process.stdout.isTTY ? new Spinner() : null;
+    if (spinner) {
+      spinner.start(`Aggregating ${request.source} daily token usage...`);
+    } else {
+      this.uiRenderer.renderInfo(`Aggregating ${request.source} daily token usage...`);
+    }
+
+    try {
+      const target = await this.resolveTokenScanTarget(request);
+      if (target.filePaths.length === 0) {
+        if (spinner) {
+          spinner.stop('Token usage aggregation completed');
+        } else {
+          this.uiRenderer.renderSuccess('Token usage aggregation completed');
+        }
+        this.uiRenderer.renderWarning('No JSONL files found for token usage aggregation');
+        this.recordCommandData(
+          'token_usage',
+          [`scope=${target.scopeLabel}`, `source=${target.sourceLabel}`, 'jsonlFiles=0'].join('\n')
+        );
+        return;
+      }
+
+      const records = await this.collectContextUsageRecords(target.filePaths, target.source);
+      const summary = this.buildTokenUsageSummary(target.filePaths, records);
+      if (spinner) {
+        spinner.stop('Token usage aggregation completed');
+      } else {
+        this.uiRenderer.renderSuccess('Token usage aggregation completed');
+      }
+
+      if (summary.totalRecords === 0) {
+        this.uiRenderer.renderWarning('No token usage records found in scanned JSONL files');
+        this.recordCommandData(
+          'token_usage',
+          [
+            `scope=${target.scopeLabel}`,
+            `source=${target.sourceLabel}`,
+            `jsonlFiles=${target.filePaths.length}`,
+            'usageRecords=0',
+          ].join('\n')
+        );
+        return;
+      }
+
+      await this.renderTokenUsageSummary(target, summary);
+      const topModels = summary.models
+        .slice(0, 4)
+        .map((model) => `${model.model}:${Math.round(model.totalTokens)}`)
+        .join(', ');
+      this.recordCommandData(
+        'token_usage',
+        [
+          `scope=${target.scopeLabel}`,
+          `source=${target.sourceLabel}`,
+          `projectDirs=${target.projectDirs.length}`,
+          `jsonlFiles=${target.filePaths.length}`,
+          `usageRecords=${summary.totalRecords}`,
+          `activeDays=${summary.totalDays}`,
+          `models=${summary.models.length}`,
+          `totalTokens=${Math.round(summary.totalTokens)}`,
+          `inputTokens=${Math.round(summary.inputTokens)}`,
+          `outputTokens=${Math.round(summary.outputTokens)}`,
+          `topModels=${topModels || '(none)'}`,
+        ].join('\n')
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to aggregate token usage';
+      if (spinner) {
+        spinner.fail(message);
+      } else {
+        this.uiRenderer.renderError(message);
+      }
+      this.recordCommandData('token_usage', `failed: ${message}`);
+    }
+  }
+
+  private async showCurrentCostEstimate(args: string[]): Promise<void> {
+    const spinner = process.stdout.isTTY ? new Spinner() : null;
+    if (spinner) {
+      spinner.start('Estimating current request cost...');
+    } else {
+      this.uiRenderer.renderInfo('Estimating current request cost...');
+    }
+
+    try {
+      const presentation = await this.buildCurrentCostEstimate(args);
+      if (spinner) {
+        spinner.stop('Cost estimate completed');
+      } else {
+        this.uiRenderer.renderSuccess('Cost estimate completed');
+      }
+
+      await this.renderCostEstimate(presentation);
+      this.recordCommandData(
+        'cost',
+        [
+          `targetFamily=${presentation.targetFamily}`,
+          `provider=${presentation.provider}`,
+          `activeModel=${presentation.activeModel}`,
+          `inputTokens=${Math.round(presentation.totalInputTokens)}`,
+          `cacheEligibleTokens=${Math.round(presentation.cacheEligibleTokens)}`,
+          `dynamicTokens=${Math.round(presentation.dynamicTokens)}`,
+          ...presentation.variants.flatMap((variant) => [
+            `model=${variant.label}:${variant.resolvedMatch.entry.id}:${variant.resolvedMatch.strategy}`,
+            ...variant.scenarios.map(
+              (scenario) =>
+                `${variant.label}/${scenario.label}: inputUsd=${scenario.inputCostUsd.toFixed(6)}, totalWith${presentation.outputExampleTokens}OutUsd=${scenario.totalWithOutputExampleUsd.toFixed(6)}`
+            ),
+          ]),
+        ].join('\n')
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to estimate current request cost';
+      if (spinner) {
+        spinner.fail(message);
+      } else {
+        this.uiRenderer.renderError(message);
+      }
+      this.recordCommandData('cost', `failed: ${message}`);
+    }
+  }
+
+  private async buildCurrentCostEstimate(args: string[]): Promise<CostEstimatePresentation> {
+    const config = await this.configStore.getConfig();
+    const provider = config.activeProvider;
+    const activeModel = config.providers[provider]?.model?.trim() || '';
+    if (!activeModel) {
+      throw new Error(`Current ${getProviderMeta(provider).displayName} model is not configured. Use /model first.`);
+    }
+
+    const targetFamily = this.resolveCostEstimateFamily(args, provider, activeModel);
+    if (targetFamily === 'cursor') {
+      throw new Error('Cursor model pricing is not publicly available, so /cost cursor is intentionally not supported.');
+    }
+
+    const segmentSnapshot = await this.withTimeout(
+      () => this.collectCurrentCostSegments(targetFamily === 'claude' ? 'claude' : 'openrouter'),
+      CommandHandler.SCAN_PROMPT_TIMEOUT_MS,
+      `/cost timed out after ${this.formatTimeoutMs(CommandHandler.SCAN_PROMPT_TIMEOUT_MS)}.`
+    );
+
+    const openRouterBaseUrl = config.providers.openrouter?.baseUrl?.trim() || getProviderMeta('openrouter').defaultBaseUrl;
+    const openRouterApiKey = config.providers.openrouter?.apiKey?.trim() || undefined;
+    const catalogEntries = await this.openRouterModelCatalog.fetchModels(openRouterBaseUrl, openRouterApiKey);
+    const variants = this.resolveCostEstimateVariants(targetFamily, activeModel, catalogEntries);
+    if (variants.length === 0) {
+      throw new Error(`No OpenRouter pricing models were resolved for /cost ${targetFamily}.`);
+    }
+
+    const outputExampleTokens = CommandHandler.COST_ESTIMATE_OUTPUT_EXAMPLE_TOKENS;
+    const pricedVariants = variants.map((variant) => {
+      const rates: CostEstimateRateCard = {
+        prompt: variant.resolvedMatch.entry.pricing.prompt,
+        completion: variant.resolvedMatch.entry.pricing.completion,
+        request: variant.resolvedMatch.entry.pricing.request,
+        inputCacheRead: variant.resolvedMatch.entry.pricing.inputCacheRead,
+        inputCacheWrite: variant.resolvedMatch.entry.pricing.inputCacheWrite,
+      };
+
+      if (rates.prompt === null) {
+        throw new Error(`OpenRouter pricing for ${variant.resolvedMatch.entry.id} does not include prompt pricing.`);
+      }
+
+      return {
+        ...variant,
+        rates,
+        scenarios: this.buildCostEstimateScenarios(
+          segmentSnapshot.cacheEligibleTokens,
+          segmentSnapshot.dynamicTokens,
+          rates,
+          outputExampleTokens
+        ),
+      };
+    });
+
+    const assumptions = [
+      'Cache-eligible prefix is estimated as core instructions, reusable rules/prompts, and scanned reference docs.',
+      'Chat history and the active user request stay dynamic, so they are always charged at the regular prompt rate.',
+      `Scenario totals include each model's request fee and a ${outputExampleTokens.toLocaleString('en-US')}-token output example.`,
+      'OpenRouter pricing is fetched live from /api/v1/models and cached locally for 24 hours (~/.claude-estimator/model-prices.json).',
+    ];
+
+    return {
+      targetFamily,
+      targetLabel: this.getCostEstimateTargetLabel(targetFamily),
+      provider,
+      providerLabel: getProviderMeta(provider).displayName,
+      activeModel,
+      totalInputTokens: segmentSnapshot.totalInputTokens,
+      cacheEligibleTokens: segmentSnapshot.cacheEligibleTokens,
+      dynamicTokens: segmentSnapshot.dynamicTokens,
+      outputExampleTokens,
+      segments: segmentSnapshot.segments,
+      variants: pricedVariants,
+      assumptions,
+    };
+  }
+
+  private resolveCostEstimateFamily(args: string[], provider: ProviderName, activeModel: string): CostEstimateFamily {
+    const normalized = args[0]?.trim().toLowerCase();
+    if (normalized === 'codex' || normalized === 'openai' || normalized === 'gpt') {
+      return 'codex';
+    }
+    if (normalized === 'claude' || normalized === 'anthropic') {
+      return 'claude';
+    }
+    if (normalized === 'cursor') {
+      return 'cursor';
+    }
+    if (normalized === 'qwen') {
+      throw new Error('Qwen pricing is not being estimated right now. Use /cost codex or /cost claude instead.');
+    }
+    if (normalized) {
+      throw new Error(`Unknown /cost target "${args[0]}". Use /cost codex, /cost claude, or /cost cursor.`);
+    }
+
+    const lowerModel = activeModel.toLowerCase();
+    if (provider === 'claude' || lowerModel.includes('claude')) {
+      return 'claude';
+    }
+    if (lowerModel.includes('gpt') || lowerModel.includes('codex') || lowerModel.includes('openai/')) {
+      return 'codex';
+    }
+
+    throw new Error('Cannot infer a pricing family from the current model. Use /cost codex or /cost claude explicitly.');
+  }
+
+  private getCostEstimateTargetLabel(targetFamily: CostEstimateFamily): string {
+    if (targetFamily === 'claude') {
+      return 'Claude family';
+    }
+    if (targetFamily === 'codex') {
+      return 'Codex / GPT family';
+    }
+    return 'Cursor';
+  }
+
+  private resolveCostEstimateVariants(
+    targetFamily: Exclude<CostEstimateFamily, 'cursor'>,
+    activeModel: string,
+    entries: OpenRouterModelCatalogEntry[]
+  ): Array<{ label: string; resolvedMatch: OpenRouterModelMatch }> {
+    const seen = new Set<string>();
+    const variants: Array<{ label: string; resolvedMatch: OpenRouterModelMatch }> = [];
+
+    const pushVariant = (label: string, modelName: string) => {
+      const resolvedMatch = this.openRouterModelCatalog.resolveModel(modelName, entries, 'openrouter');
+      if (!resolvedMatch || seen.has(resolvedMatch.entry.id)) {
+        return;
+      }
+      seen.add(resolvedMatch.entry.id);
+      variants.push({ label, resolvedMatch });
+    };
+
+    if (targetFamily === 'codex') {
+      if (activeModel.toLowerCase().includes('gpt') || activeModel.toLowerCase().includes('codex')) {
+        pushVariant('Current match', activeModel);
+      }
+      pushVariant('GPT-5.4', 'openai/gpt-5.4');
+      pushVariant('GPT-5.3 Codex', 'openai/gpt-5.3-codex');
+      return variants;
+    }
+
+    const claudeBuckets: Array<{ label: string; candidates: string[] }> = [
+      {
+        label: 'Opus',
+        candidates: ['anthropic/claude-opus-4.6'],
+      },
+      {
+        label: 'Sonnet',
+        candidates: ['anthropic/claude-sonnet-4.6'],
+      },
+      {
+        label: 'Haiku',
+        candidates: ['anthropic/claude-haiku-4.5'],
+      },
+    ];
+
+    claudeBuckets.forEach((bucket) => {
+      for (const candidate of bucket.candidates) {
+        const resolvedMatch = this.openRouterModelCatalog.resolveModel(candidate, entries, 'claude');
+        if (!resolvedMatch || seen.has(resolvedMatch.entry.id)) {
+          continue;
+        }
+        seen.add(resolvedMatch.entry.id);
+        variants.push({ label: bucket.label, resolvedMatch });
+        break;
+      }
+    });
+
+    if (variants.length === 0 && activeModel.toLowerCase().includes('claude')) {
+      pushVariant('Current match', activeModel);
+    }
+
+    return variants;
+  }
+
+  private async collectCurrentCostSegments(provider: ProviderName): Promise<{
+    segments: CostEstimateSegment[];
+    totalInputTokens: number;
+    cacheEligibleTokens: number;
+    dynamicTokens: number;
+  }> {
+    const rootPath = process.cwd();
+    const scanResult = await this.promptAssetScanner.scan(rootPath, {
+      tokenCounter: async (text: string) => this.countTokensForProvider(text, provider),
+    });
+
+    const systemFiles: Array<{ tokenCount: number }> = [];
+    const promptLibraryFiles: Array<{ tokenCount: number }> = [];
+    const referenceDocsFiles: Array<{ tokenCount: number }> = [];
+    scanResult.files.forEach((file) => {
+      const bucket = this.classifyPromptAssetForAnatomy(file);
+      if (bucket === 'system') {
+        systemFiles.push(file);
+        return;
+      }
+      if (bucket === 'prompt_library') {
+        promptLibraryFiles.push(file);
+        return;
+      }
+      referenceDocsFiles.push(file);
+    });
+
+    const messages = this.conversationManager.getMessages();
+    const latestUserMessage = [...messages].reverse().find((message) => message.role === 'user');
+    const historyMessages = messages.filter((message) => message.id !== latestUserMessage?.id);
+    const [userMessageTokens, historyTokenParts] = await Promise.all([
+      latestUserMessage ? this.countTokensForProvider(latestUserMessage.content, provider) : Promise.resolve(0),
+      Promise.all(historyMessages.map((message) => this.countTokensForProvider(message.content, provider))),
+    ]);
+
+    const segments: CostEstimateSegment[] = [
+      {
+        key: 'system',
+        label: 'Core instructions',
+        tokenCount: systemFiles.reduce((sum, file) => sum + file.tokenCount, 0),
+        cacheEligible: true,
+      },
+      {
+        key: 'prompt_library',
+        label: 'Rules & prompts',
+        tokenCount: promptLibraryFiles.reduce((sum, file) => sum + file.tokenCount, 0),
+        cacheEligible: true,
+      },
+      {
+        key: 'reference_docs',
+        label: 'Reference docs',
+        tokenCount: referenceDocsFiles.reduce((sum, file) => sum + file.tokenCount, 0),
+        cacheEligible: true,
+      },
+      {
+        key: 'chat_history',
+        label: 'Chat history',
+        tokenCount: historyTokenParts.reduce((sum, value) => sum + value, 0),
+        cacheEligible: false,
+      },
+      {
+        key: 'active_request',
+        label: 'Active request',
+        tokenCount: userMessageTokens,
+        cacheEligible: false,
+      },
+    ];
+
+    const totalInputTokens = segments.reduce((sum, segment) => sum + segment.tokenCount, 0);
+    const cacheEligibleTokens = segments
+      .filter((segment) => segment.cacheEligible)
+      .reduce((sum, segment) => sum + segment.tokenCount, 0);
+    const dynamicTokens = Math.max(0, totalInputTokens - cacheEligibleTokens);
+
+    return {
+      segments,
+      totalInputTokens,
+      cacheEligibleTokens,
+      dynamicTokens,
+    };
+  }
+
+  private async countTokensForProvider(text: string, provider: ProviderName): Promise<number> {
+    try {
+      if (provider === 'claude') {
+        return await this.claudeTokenizer.countTextTokens(text);
+      }
+      return await this.tiktokenTokenizer.countTextTokens(text);
+    } catch {
+      return estimateTokenCount(text);
+    }
+  }
+
+  private buildCostEstimateScenarios(
+    cacheEligibleTokens: number,
+    dynamicTokens: number,
+    rates: CostEstimateRateCard,
+    outputExampleTokens: number
+  ): CostEstimateScenario[] {
+    const completionRate = rates.completion ?? 0;
+    const outputExampleCostUsd = outputExampleTokens * completionRate;
+    const coldInputCostUsd = this.calculateInputCostUsd(cacheEligibleTokens, dynamicTokens, rates, 'cold');
+    const cacheWriteUsesFallback = rates.inputCacheWrite === null;
+    const cacheReadUsesFallback = rates.inputCacheRead === null;
+
+    const scenarios: CostEstimateScenario[] = [
+      {
+        label: 'Cold request',
+        inputCostUsd: coldInputCostUsd,
+        outputExampleCostUsd,
+        totalWithOutputExampleUsd: coldInputCostUsd + outputExampleCostUsd,
+        savingsVsColdUsd: 0,
+        note: 'All input is charged at the normal prompt rate.',
+      },
+      {
+        label: 'Cache write',
+        inputCostUsd: this.calculateInputCostUsd(cacheEligibleTokens, dynamicTokens, rates, 'cache-write'),
+        outputExampleCostUsd,
+        totalWithOutputExampleUsd:
+          this.calculateInputCostUsd(cacheEligibleTokens, dynamicTokens, rates, 'cache-write') + outputExampleCostUsd,
+        savingsVsColdUsd: 0,
+        note: cacheWriteUsesFallback
+          ? 'This model does not expose a separate cache-write price, so prompt pricing is used as fallback.'
+          : 'Stable prefix is written into cache on this request; dynamic tokens stay uncached.',
+      },
+      {
+        label: 'Cache hit',
+        inputCostUsd: this.calculateInputCostUsd(cacheEligibleTokens, dynamicTokens, rates, 'cache-hit'),
+        outputExampleCostUsd,
+        totalWithOutputExampleUsd:
+          this.calculateInputCostUsd(cacheEligibleTokens, dynamicTokens, rates, 'cache-hit') + outputExampleCostUsd,
+        savingsVsColdUsd: 0,
+        note: cacheReadUsesFallback
+          ? 'This model does not expose a separate cache-read price, so prompt pricing is used as fallback.'
+          : 'Stable prefix is assumed to be fully cached already; only dynamic tokens pay the full prompt rate.',
+      },
+    ];
+
+    return scenarios.map((scenario) => ({
+      ...scenario,
+      savingsVsColdUsd: Math.max(0, coldInputCostUsd - scenario.inputCostUsd),
+    }));
+  }
+
+  private calculateInputCostUsd(
+    cacheEligibleTokens: number,
+    dynamicTokens: number,
+    rates: CostEstimateRateCard,
+    mode: 'cold' | 'cache-write' | 'cache-hit'
+  ): number {
+    const promptRate = rates.prompt ?? 0;
+    const requestFee = rates.request ?? 0;
+    const cacheEligibleRate =
+      mode === 'cold'
+        ? promptRate
+        : mode === 'cache-write'
+          ? rates.inputCacheWrite ?? promptRate
+          : rates.inputCacheRead ?? promptRate;
+
+    return cacheEligibleTokens * cacheEligibleRate + dynamicTokens * promptRate + requestFee;
+  }
+
+  private async renderCostEstimate(presentation: CostEstimatePresentation): Promise<void> {
+    try {
+      await renderStaticInkScreen(
+        createElement(CostEstimateScreen, {
+          targetLabel: presentation.targetLabel,
+          providerLabel: presentation.providerLabel,
+          activeModel: presentation.activeModel,
+          totalInputTokens: presentation.totalInputTokens,
+          cacheEligibleTokens: presentation.cacheEligibleTokens,
+          dynamicTokens: presentation.dynamicTokens,
+          outputExampleTokens: presentation.outputExampleTokens,
+          segments: presentation.segments.map((segment) => ({
+            label: segment.label,
+            tokenCount: segment.tokenCount,
+            cacheEligible: segment.cacheEligible,
+          })),
+          variants: presentation.variants.map((variant) => ({
+            label: variant.label,
+            resolvedModelId: variant.resolvedMatch.entry.id,
+            resolvedBy: this.formatCostResolveStrategy(variant.resolvedMatch),
+            rates: [
+              { label: 'Prompt', perMillionUsd: this.toPerMillionUsd(variant.rates.prompt) },
+              { label: 'Completion', perMillionUsd: this.toPerMillionUsd(variant.rates.completion) },
+              { label: 'Cache read', perMillionUsd: this.toPerMillionUsd(variant.rates.inputCacheRead) },
+              { label: 'Cache write', perMillionUsd: this.toPerMillionUsd(variant.rates.inputCacheWrite) },
+              { label: 'Request fee', perMillionUsd: variant.rates.request },
+            ],
+            scenarios: variant.scenarios,
+          })),
+          assumptions: presentation.assumptions,
+        })
+      );
+      return;
+    } catch {
+      this.renderCostEstimateFallback(presentation);
+    }
+  }
+
+  private renderCostEstimateFallback(presentation: CostEstimatePresentation): void {
+    const headerLines = [
+      `Target family: ${presentation.targetLabel}`,
+      `Provider: ${presentation.providerLabel}`,
+      `Active model: ${presentation.activeModel}`,
+      `Input tokens: ${this.formatTokenNumber(presentation.totalInputTokens)} tok`,
+      `Cache-eligible: ${this.formatTokenNumber(presentation.cacheEligibleTokens)} tok`,
+      `Dynamic: ${this.formatTokenNumber(presentation.dynamicTokens)} tok`,
+      `Output example: ${this.formatTokenNumber(presentation.outputExampleTokens)} tok`,
+    ];
+
+    console.log(
+      boxen(headerLines.join('\n'), {
+        borderStyle: 'round',
+        borderColor: 'cyan',
+        title: ' Cost Estimate ',
+        titleAlignment: 'left',
+        padding: { top: 0, right: 1, bottom: 0, left: 1 },
+      })
+    );
+
+    console.log('');
+    console.log(chalk.bold('  Segments'));
+    presentation.segments.forEach((segment) => {
+      const suffix = segment.cacheEligible ? 'cached-prefix' : 'dynamic';
+      console.log(
+        `  ${segment.cacheEligible ? chalk.cyan('-') : chalk.dim('-')} ${chalk.white(segment.label.padEnd(18, ' '))} ${this
+          .formatTokenNumber(segment.tokenCount)
+          .padStart(8, ' ')} tok ${chalk.dim(suffix)}`
+      );
+    });
+
+    console.log('');
+    console.log(chalk.bold('  Models'));
+    presentation.variants.forEach((variant) => {
+      const resolved = variant.resolvedMatch.entry;
+      const rateLines = [
+        `Prompt: ${this.formatUsd(this.toPerMillionUsd(variant.rates.prompt), true)} / 1M tok`,
+        `Completion: ${this.formatUsd(this.toPerMillionUsd(variant.rates.completion), true)} / 1M tok`,
+        `Cache read: ${this.formatUsd(this.toPerMillionUsd(variant.rates.inputCacheRead), true)} / 1M tok`,
+        `Cache write: ${this.formatUsd(this.toPerMillionUsd(variant.rates.inputCacheWrite), true)} / 1M tok`,
+        `Request fee: ${this.formatUsd(variant.rates.request, true)}`,
+      ];
+      console.log(`  - ${chalk.white(variant.label)}  ${chalk.dim(`${resolved.id} · ${this.formatCostResolveStrategy(variant.resolvedMatch)}`)}`);
+      rateLines.forEach((line) => console.log(`    ${chalk.dim(line)}`));
+      variant.scenarios.forEach((scenario) => {
+        console.log(
+          `    ${chalk.white(scenario.label)}  input ${this.formatUsd(scenario.inputCostUsd, true)}  total(+${presentation.outputExampleTokens} out) ${this.formatUsd(scenario.totalWithOutputExampleUsd, true)}`
+        );
+        console.log(`      ${chalk.dim(`save vs cold ${this.formatUsd(scenario.savingsVsColdUsd, true)} | ${scenario.note}`)}`);
+      });
+    });
+
+    console.log('');
+    console.log(chalk.bold('  Assumptions'));
+    presentation.assumptions.forEach((assumption) => {
+      console.log(chalk.dim(`  - ${assumption}`));
+    });
+  }
+
+  private formatCostResolveStrategy(match: OpenRouterModelMatch): string {
+    const labels: Record<OpenRouterModelMatch['strategy'], string> = {
+      'exact-id': 'exact id',
+      'exact-canonical': 'exact canonical slug',
+      'provider-prefixed': 'provider prefix heuristic',
+      'suffix-id': 'suffix id match',
+      'suffix-canonical': 'suffix canonical match',
+      basename: 'basename heuristic',
+    };
+    return labels[match.strategy];
+  }
+
+  private toPerMillionUsd(ratePerToken: number | null): number | null {
+    if (ratePerToken === null) {
+      return null;
+    }
+    return ratePerToken * 1_000_000;
+  }
+
+  private formatUsd(value: number | null, allowNa = false): string {
+    if (value === null) {
+      return allowNa ? 'n/a' : '$0.000000';
+    }
+    if (value === 0) {
+      return '$0.0000';
+    }
+    if (Math.abs(value) >= 1) {
+      return `$${value.toFixed(2)}`;
+    }
+    if (Math.abs(value) >= 0.01) {
+      return `$${value.toFixed(4)}`;
+    }
+    return `$${value.toFixed(6)}`;
   }
 
   private async checkContextHealth(args: string[]): Promise<void> {
@@ -2277,6 +3037,43 @@ export class CommandHandler {
     );
   }
 
+  private async collectContextUsageRecords(
+    filePaths: string[],
+    source: TokenScanSource
+  ): Promise<ContextUsageRecord[]> {
+    const collected: ContextUsageRecord[] = [];
+
+    for (const filePath of filePaths) {
+      let raw = '';
+      let fileTimestampMs = 0;
+      try {
+        raw = await fs.readFile(filePath, 'utf8');
+        const stat = await fs.stat(filePath);
+        fileTimestampMs = Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : 0;
+      } catch {
+        continue;
+      }
+
+      const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
+      const codexDefaults = source === 'codex' ? this.readCodexUsageDefaults(lines) : null;
+      for (const line of lines) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line) as unknown;
+        } catch {
+          continue;
+        }
+
+        const candidate = this.extractContextUsageRecord(parsed, filePath, fileTimestampMs, source, codexDefaults);
+        if (candidate) {
+          collected.push(candidate);
+        }
+      }
+    }
+
+    return collected.sort((a, b) => b.timestampMs - a.timestampMs);
+  }
+
   private async findRecentContextUsageRecords(
     filePaths: string[],
     maxRecords: number,
@@ -2373,13 +3170,20 @@ export class CommandHandler {
       }
 
       const inputTokens = this.getNumberAtPaths(usageObject, [['input_tokens']]) ?? 0;
+      const outputTokens = this.sumNumbers([
+        this.getNumberAtPaths(usageObject, [['output_tokens']]),
+        this.getNumberAtPaths(usageObject, [['reasoning_output_tokens']]),
+      ]);
       const cacheReadTokens =
         this.getNumberAtPaths(usageObject, [['cached_input_tokens'], ['cache_read_input_tokens'], ['cacheReadInputTokens']]) ?? 0;
+      const totalTokens =
+        this.getNumberAtPaths(usageObject, [['total_tokens']]) ??
+        Math.max(0, inputTokens + outputTokens + cacheReadTokens);
       const contextWindowTokens =
         this.getNumberAtPaths(payload, [['payload', 'info', 'model_context_window'], ['payload', 'model_context_window']]) ??
         defaults?.contextWindowTokens ??
         null;
-      const hasUsage = inputTokens > 0 || cacheReadTokens > 0;
+      const hasUsage = inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0 || totalTokens > 0;
       if (!hasUsage && contextWindowTokens === null) {
         return null;
       }
@@ -2393,8 +3197,10 @@ export class CommandHandler {
         contextUsedPercent: null,
         contextWindowTokens: contextWindowTokens === null ? null : Math.max(1, Math.round(contextWindowTokens)),
         inputTokens,
+        outputTokens,
         cacheCreationTokens: 0,
         cacheReadTokens,
+        totalTokens,
       };
     }
 
@@ -2404,10 +3210,17 @@ export class CommandHandler {
       this.getObjectAtPath(payload, ['response', 'usage']);
 
     const inputTokens = this.getNumberAtPaths(usageObject, [['input_tokens'], ['inputTokens']]) ?? 0;
+    const outputTokens = this.sumNumbers([
+      this.getNumberAtPaths(usageObject, [['output_tokens'], ['outputTokens']]),
+      this.getNumberAtPaths(usageObject, [['reasoning_output_tokens'], ['reasoningOutputTokens']]),
+    ]);
     const cacheCreationTokens =
       this.getNumberAtPaths(usageObject, [['cache_creation_input_tokens'], ['cacheCreationInputTokens']]) ?? 0;
     const cacheReadTokens =
       this.getNumberAtPaths(usageObject, [['cache_read_input_tokens'], ['cacheReadInputTokens']]) ?? 0;
+    const totalTokens =
+      this.getNumberAtPaths(usageObject, [['total_tokens'], ['totalTokens']]) ??
+      Math.max(0, inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens);
 
     const contextUsedPercent =
       this.getNumberAtPaths(payload, [
@@ -2426,7 +3239,7 @@ export class CommandHandler {
         ['contextWindow', 'contextWindowSize'],
       ]) ?? null;
 
-    const hasUsage = inputTokens > 0 || cacheCreationTokens > 0 || cacheReadTokens > 0;
+    const hasUsage = inputTokens > 0 || outputTokens > 0 || cacheCreationTokens > 0 || cacheReadTokens > 0 || totalTokens > 0;
     const hasContextPercent = contextUsedPercent !== null;
     if (!hasUsage && !hasContextPercent) {
       return null;
@@ -2449,8 +3262,10 @@ export class CommandHandler {
       contextUsedPercent: contextUsedPercent === null ? null : Math.max(0, Math.min(100, contextUsedPercent)),
       contextWindowTokens: contextWindowTokens === null ? null : Math.max(1, Math.round(contextWindowTokens)),
       inputTokens,
+      outputTokens,
       cacheCreationTokens,
       cacheReadTokens,
+      totalTokens,
     };
   }
 
@@ -3361,6 +4176,13 @@ export class CommandHandler {
     return null;
   }
 
+  private sumNumbers(values: Array<number | null | undefined>): number {
+    return values.reduce<number>(
+      (sum, value) => sum + (typeof value === 'number' && Number.isFinite(value) ? value : 0),
+      0
+    );
+  }
+
   private getStringAtPaths(payload: unknown, keyPaths: string[][]): string | null {
     for (const keyPath of keyPaths) {
       const value = this.getValueAtPath(payload, keyPath);
@@ -3393,7 +4215,7 @@ export class CommandHandler {
     }
 
     const first = args[0]?.trim().toLowerCase();
-    const explicitSource = first === 'claude' || first === 'codex';
+    const explicitSource = first === 'claude' || first === 'codex' || first === 'cursor';
     const source: TokenScanSource = explicitSource ? (first as TokenScanSource) : 'claude';
     const rest = explicitSource ? args.slice(1) : args;
     const normalized = rest[0]?.trim().toLowerCase();
@@ -3412,7 +4234,7 @@ export class CommandHandler {
     if (request.scope === 'path') {
       const inputPath = request.rawPath?.trim();
       if (!inputPath) {
-        throw new Error('Missing path. Usage: /scan_tokens [claude|codex] [current|all|path]');
+        throw new Error('Missing path. Usage: /scan_tokens [claude|codex|cursor] [current|all|path]');
       }
 
       const expandedPath = this.expandHomePath(inputPath);
@@ -3446,7 +4268,9 @@ export class CommandHandler {
       const filePaths =
         detectedSource === 'codex'
           ? await this.listRecentCodexRolloutFiles(resolvedPath, CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL)
-          : await this.listRecentJsonlFiles(resolvedPath, CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL);
+          : detectedSource === 'cursor'
+            ? await this.listRecentCursorTranscriptFiles(resolvedPath, CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL)
+            : await this.listRecentJsonlFiles(resolvedPath, CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL);
       return {
         source: detectedSource,
         scopeLabel: 'explicit_path',
@@ -3458,7 +4282,9 @@ export class CommandHandler {
 
     return request.source === 'codex'
       ? this.resolveCodexTokenScanTarget(request)
-      : this.resolveClaudeTokenScanTarget(request);
+      : request.source === 'cursor'
+        ? this.resolveCursorTokenScanTarget(request)
+        : this.resolveClaudeTokenScanTarget(request);
   }
 
   private expandHomePath(inputPath: string): string {
@@ -3483,6 +4309,16 @@ export class CommandHandler {
 
   private async resolveCodexDataDirectory(childName: 'sessions' | 'archived_sessions'): Promise<string | null> {
     const candidates = this.buildCodexDataDirectoryCandidates(childName);
+    for (const candidate of candidates) {
+      if (await this.pathExists(candidate)) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  private async resolveCursorDataDirectory(childName: 'projects' | 'skills-cursor'): Promise<string | null> {
+    const candidates = this.buildCursorDataDirectoryCandidates(childName);
     for (const candidate of candidates) {
       if (await this.pathExists(candidate)) {
         return candidate;
@@ -3549,6 +4385,35 @@ export class CommandHandler {
     return Array.from(candidates);
   }
 
+  private buildCursorDataDirectoryCandidates(childName: 'projects' | 'skills-cursor'): string[] {
+    const candidates = new Set<string>();
+    const addCandidate = (basePath: string | undefined | null): void => {
+      if (!basePath) {
+        return;
+      }
+      const trimmed = basePath.trim();
+      if (!trimmed) {
+        return;
+      }
+      candidates.add(path.resolve(trimmed, childName));
+    };
+
+    addCandidate(path.join(os.homedir(), '.cursor'));
+    addCandidate(process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.cursor') : null);
+    addCandidate(process.env.HOME ? path.join(process.env.HOME, '.cursor') : null);
+
+    if (process.env.HOMEDRIVE && process.env.HOMEPATH) {
+      addCandidate(path.join(`${process.env.HOMEDRIVE}${process.env.HOMEPATH}`, '.cursor'));
+    }
+
+    const cwdParts = path.resolve(process.cwd()).split(path.sep).filter((part) => part.length > 0);
+    if (cwdParts.length >= 3 && cwdParts[1]?.toLowerCase() === 'users') {
+      addCandidate(path.join(cwdParts[0] ?? '', 'Users', cwdParts[2] ?? '', '.cursor'));
+    }
+
+    return Array.from(candidates);
+  }
+
   private async listClaudeProjectDirectories(projectsRoot: string): Promise<string[]> {
     try {
       const entries = await fs.readdir(projectsRoot, { withFileTypes: true });
@@ -3559,6 +4424,44 @@ export class CommandHandler {
     } catch {
       return [];
     }
+  }
+
+  private async listCursorProjectDirectories(projectsRoot: string): Promise<string[]> {
+    try {
+      const entries = await fs.readdir(projectsRoot, { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => path.join(projectsRoot, entry.name))
+        .sort((a, b) => a.localeCompare(b));
+    } catch {
+      return [];
+    }
+  }
+
+  private async resolveCursorProjectDirectories(projectsRoot: string, rootPath: string): Promise<string[]> {
+    const projectDirs = await this.listCursorProjectDirectories(projectsRoot);
+    if (projectDirs.length === 0) {
+      return [];
+    }
+
+    const normalizedRoot = path.resolve(rootPath);
+    const targetKey = this.normalizeCursorProjectKey(normalizedRoot);
+    const exactMatches = projectDirs.filter(
+      (projectDir) => this.normalizeCursorProjectKey(path.basename(projectDir)) === targetKey
+    );
+    if (exactMatches.length > 0) {
+      return exactMatches;
+    }
+
+    const scored = projectDirs
+      .map((projectDir) => ({
+        projectDir,
+        score: this.scoreCursorProjectDirMatch(path.basename(projectDir), normalizedRoot),
+      }))
+      .filter((candidate) => candidate.score > 0)
+      .sort((a, b) => b.score - a.score || a.projectDir.localeCompare(b.projectDir));
+
+    return scored.slice(0, 3).map((candidate) => candidate.projectDir);
   }
 
   private async buildTokenStructureSummary(filePaths: string[], source: TokenScanSource): Promise<TokenStructureSummary> {
@@ -3617,6 +4520,226 @@ export class CommandHandler {
       typeBreakdown,
       dayBreakdown,
     };
+  }
+
+  private buildTokenUsageSummary(filePaths: string[], records: ContextUsageRecord[]): TokenUsageSummary {
+    const usageRecords = records.filter((record) => record.totalTokens > 0);
+    const modelMap = new Map<
+      string,
+      Omit<TokenUsageModelAggregate, 'activeDays'> & {
+        daySet: Set<string>;
+      }
+    >();
+    const dayMap = new Map<
+      string,
+      Omit<TokenUsageDayAggregate, 'models'> & {
+        modelMap: Map<string, TokenUsageModelDayValue>;
+      }
+    >();
+
+    let totalTokens = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cacheCreationTokens = 0;
+    let cacheReadTokens = 0;
+    let latestTimestampMs = 0;
+
+    for (const record of usageRecords) {
+      const model = this.normalizeUsageModel(record.model);
+      const day = this.toDayKey(record.timestampMs);
+
+      totalTokens += record.totalTokens;
+      inputTokens += record.inputTokens;
+      outputTokens += record.outputTokens;
+      cacheCreationTokens += record.cacheCreationTokens;
+      cacheReadTokens += record.cacheReadTokens;
+      latestTimestampMs = Math.max(latestTimestampMs, record.timestampMs);
+
+      const currentModel =
+        modelMap.get(model) ??
+        {
+          model,
+          totalTokens: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 0,
+          records: 0,
+          daySet: new Set<string>(),
+        };
+      currentModel.totalTokens += record.totalTokens;
+      currentModel.inputTokens += record.inputTokens;
+      currentModel.outputTokens += record.outputTokens;
+      currentModel.cacheCreationTokens += record.cacheCreationTokens;
+      currentModel.cacheReadTokens += record.cacheReadTokens;
+      currentModel.records += 1;
+      if (day) {
+        currentModel.daySet.add(day);
+      }
+      modelMap.set(model, currentModel);
+
+      if (!day) {
+        continue;
+      }
+
+      const currentDay =
+        dayMap.get(day) ??
+        {
+          day,
+          totalTokens: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 0,
+          records: 0,
+          modelMap: new Map<string, TokenUsageModelDayValue>(),
+        };
+      currentDay.totalTokens += record.totalTokens;
+      currentDay.inputTokens += record.inputTokens;
+      currentDay.outputTokens += record.outputTokens;
+      currentDay.cacheCreationTokens += record.cacheCreationTokens;
+      currentDay.cacheReadTokens += record.cacheReadTokens;
+      currentDay.records += 1;
+
+      const currentDayModel =
+        currentDay.modelMap.get(model) ??
+        {
+          model,
+          totalTokens: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 0,
+        };
+      currentDayModel.totalTokens += record.totalTokens;
+      currentDayModel.inputTokens += record.inputTokens;
+      currentDayModel.outputTokens += record.outputTokens;
+      currentDayModel.cacheCreationTokens += record.cacheCreationTokens;
+      currentDayModel.cacheReadTokens += record.cacheReadTokens;
+      currentDay.modelMap.set(model, currentDayModel);
+      dayMap.set(day, currentDay);
+    }
+
+    const models = Array.from(modelMap.values())
+      .map(({ daySet, ...model }) => ({
+        ...model,
+        activeDays: daySet.size,
+      }))
+      .sort((a, b) => b.totalTokens - a.totalTokens || b.records - a.records || a.model.localeCompare(b.model));
+
+    const days = Array.from(dayMap.values())
+      .map(({ modelMap: modelsByDay, ...day }) => ({
+        ...day,
+        models: Array.from(modelsByDay.values()).sort(
+          (a, b) => b.totalTokens - a.totalTokens || a.model.localeCompare(b.model)
+        ),
+      }))
+      .sort((a, b) => a.day.localeCompare(b.day));
+
+    return {
+      totalFiles: filePaths.length,
+      totalRecords: usageRecords.length,
+      totalDays: days.length,
+      totalTokens,
+      inputTokens,
+      outputTokens,
+      cacheCreationTokens,
+      cacheReadTokens,
+      latestTimestampMs,
+      models,
+      days,
+      chartDays: this.buildTokenUsageChartDays(days, 30),
+      windows: this.buildTokenUsageWindows(days),
+    };
+  }
+
+  private buildTokenUsageWindows(days: TokenUsageDayAggregate[]): TokenUsageWindowSummary[] {
+    return [
+      this.buildTokenUsageWindowSummary('All time', days),
+      this.buildTokenUsageWindowSummary('Last 7 days', days, 7),
+      this.buildTokenUsageWindowSummary('Last 30 days', days, 30),
+    ];
+  }
+
+  private buildTokenUsageWindowSummary(
+    label: string,
+    days: TokenUsageDayAggregate[],
+    dayCount?: number
+  ): TokenUsageWindowSummary {
+    const selectedDays = dayCount ? this.selectRecentTokenUsageDays(days, dayCount) : days;
+    return {
+      label,
+      totalTokens: selectedDays.reduce((sum, day) => sum + day.totalTokens, 0),
+      inputTokens: selectedDays.reduce((sum, day) => sum + day.inputTokens, 0),
+      outputTokens: selectedDays.reduce((sum, day) => sum + day.outputTokens, 0),
+      cacheCreationTokens: selectedDays.reduce((sum, day) => sum + day.cacheCreationTokens, 0),
+      cacheReadTokens: selectedDays.reduce((sum, day) => sum + day.cacheReadTokens, 0),
+      records: selectedDays.reduce((sum, day) => sum + day.records, 0),
+      activeDays: selectedDays.filter((day) => day.totalTokens > 0).length,
+    };
+  }
+
+  private selectRecentTokenUsageDays(days: TokenUsageDayAggregate[], dayCount: number): TokenUsageDayAggregate[] {
+    if (dayCount <= 0 || days.length === 0) {
+      return [];
+    }
+
+    const latestDay = days[days.length - 1]?.day;
+    if (!latestDay) {
+      return [];
+    }
+
+    const latestDate = new Date(`${latestDay}T00:00:00`);
+    if (Number.isNaN(latestDate.getTime())) {
+      return days.slice(-dayCount);
+    }
+
+    const cutoff = new Date(latestDate);
+    cutoff.setDate(cutoff.getDate() - (dayCount - 1));
+    const cutoffKey = this.toDayKey(cutoff.getTime());
+    return days.filter((day) => day.day >= cutoffKey);
+  }
+
+  private buildTokenUsageChartDays(days: TokenUsageDayAggregate[], dayCount: number): TokenUsageDayAggregate[] {
+    if (dayCount <= 0 || days.length === 0) {
+      return [];
+    }
+
+    const latestDay = days[days.length - 1]?.day;
+    if (!latestDay) {
+      return [];
+    }
+
+    const latestDate = new Date(`${latestDay}T00:00:00`);
+    if (Number.isNaN(latestDate.getTime())) {
+      return days.slice(-dayCount);
+    }
+
+    const dayMap = new Map(days.map((day) => [day.day, day]));
+    const result: TokenUsageDayAggregate[] = [];
+    for (let index = dayCount - 1; index >= 0; index -= 1) {
+      const current = new Date(latestDate);
+      current.setDate(current.getDate() - index);
+      const dayKey = this.toDayKey(current.getTime());
+      result.push(
+        dayMap.get(dayKey) ?? {
+          day: dayKey,
+          totalTokens: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 0,
+          records: 0,
+          models: [],
+        }
+      );
+    }
+    return result;
+  }
+
+  private normalizeUsageModel(model: string): string {
+    const normalized = model.trim();
+    return normalized || 'unknown';
   }
 
   private async analyzeTokenJsonlFile(
@@ -4102,6 +5225,114 @@ export class CommandHandler {
     });
   }
 
+  private async renderTokenUsageSummary(target: TokenScanTarget, summary: TokenUsageSummary): Promise<void> {
+    try {
+      await renderStaticInkScreen(
+        createElement(TokenUsageScreen, {
+          scopeLabel: target.scopeLabel,
+          sourceLabel: target.sourceLabel,
+          projectDirCount: target.projectDirs.length,
+          summary,
+        })
+      );
+      return;
+    } catch {
+      this.renderTokenUsageSummaryFallback(target, summary);
+    }
+  }
+
+  private renderTokenUsageSummaryFallback(target: TokenScanTarget, summary: TokenUsageSummary): void {
+    const recentLabel = summary.latestTimestampMs > 0 ? new Date(summary.latestTimestampMs).toLocaleString() : 'none';
+    const windowsText = summary.windows
+      .map((window) => `${window.label}: ${this.formatCompactTokenNumber(window.totalTokens)}`)
+      .join(' | ');
+    const headerLines: string[] = [
+      `Scope: ${target.scopeLabel}`,
+      `Source: ${target.sourceLabel}`,
+      `Project dirs: ${target.projectDirs.length}`,
+      `JSONL files: ${summary.totalFiles}`,
+      `Usage records: ${this.formatTokenNumber(summary.totalRecords)} over ${this.formatTokenNumber(summary.totalDays)} days`,
+      `Total: ${this.formatCompactTokenNumber(summary.totalTokens)}  (in ${this.formatCompactTokenNumber(summary.inputTokens)} / out ${this.formatCompactTokenNumber(summary.outputTokens)})`,
+      `Cache: create ${this.formatCompactTokenNumber(summary.cacheCreationTokens)} / read ${this.formatCompactTokenNumber(summary.cacheReadTokens)}`,
+      `Recent activity: ${recentLabel}`,
+      windowsText,
+    ];
+
+    console.log(
+      boxen(headerLines.join('\n'), {
+        borderStyle: 'round',
+        borderColor: 'cyan',
+        title: ' Token Usage ',
+        titleAlignment: 'left',
+        padding: { top: 0, right: 1, bottom: 0, left: 1 },
+      })
+    );
+
+    console.log('');
+    console.log(chalk.bold('  Models'));
+    if (summary.models.length === 0) {
+      console.log(chalk.dim('  - (no usage records found)'));
+    } else {
+      summary.models.slice(0, 8).forEach((model, index) => {
+        const colorize = this.getUsageModelColor(index);
+        const share = summary.totalTokens > 0 ? `${((model.totalTokens / summary.totalTokens) * 100).toFixed(1)}%` : '0.0%';
+        const sparkline = this.buildUsageSparkline(summary.chartDays, model.model);
+        console.log(
+          `  ${colorize('●')} ${this.truncateBlockName(model.model, 26).padEnd(26, ' ')} ${sparkline} ${this.formatCompactTokenNumber(model.totalTokens).padStart(8, ' ')} ${chalk.dim(share)}`
+        );
+        console.log(
+          `    in ${this.formatCompactTokenNumber(model.inputTokens)}  out ${this.formatCompactTokenNumber(model.outputTokens)}  cache ${this.formatCompactTokenNumber(model.cacheCreationTokens + model.cacheReadTokens)}  ${chalk.dim(`${model.records} rec / ${model.activeDays} days`)}`
+        );
+      });
+    }
+
+    console.log('');
+    console.log(chalk.bold('  Daily Totals'));
+    if (summary.days.length === 0) {
+      console.log(chalk.dim('  - (no day buckets found)'));
+      return;
+    }
+
+    const maxValue = summary.chartDays.reduce((max, day) => Math.max(max, day.totalTokens), 0);
+    summary.days.slice(-10).forEach((day) => {
+      const row = this.renderTokenBar(day.totalTokens, maxValue, chalk.yellow);
+      const dominant = day.models
+        .slice(0, 2)
+        .map((model) => `${this.truncateBlockName(model.model, 18)} ${this.formatCompactTokenNumber(model.totalTokens)}`)
+        .join(' | ');
+      console.log(
+        `  ${row} ${day.day}  ${this.formatCompactTokenNumber(day.totalTokens).padStart(8, ' ')} ${chalk.dim(`${day.records} rec`)}`
+      );
+      if (dominant) {
+        console.log(`    ${chalk.dim(dominant)}`);
+      }
+    });
+  }
+
+  private getUsageModelColor(index: number): (value: string) => string {
+    const palette = [chalk.hex('#A5B4FC'), chalk.hex('#4ADE80'), chalk.hex('#FACC15'), chalk.hex('#38BDF8'), chalk.hex('#F472B6')];
+    return palette[index % palette.length];
+  }
+
+  private buildUsageSparkline(days: TokenUsageDayAggregate[], modelName: string): string {
+    const levels = '▁▂▃▄▅▆▇█';
+    const values = days.map((day) => day.models.find((model) => model.model === modelName)?.totalTokens ?? 0);
+    const maxValue = values.reduce((max, value) => Math.max(max, value), 0);
+    if (maxValue <= 0) {
+      return chalk.dim('·'.repeat(Math.max(8, values.length)));
+    }
+
+    return values
+      .map((value) => {
+        if (value <= 0) {
+          return chalk.dim('·');
+        }
+        const level = Math.min(levels.length - 1, Math.max(0, Math.round((value / maxValue) * (levels.length - 1))));
+        return levels[level];
+      })
+      .join('');
+  }
+
   private renderTokenBar(value: number, maxValue: number, colorize: (value: string) => string): string {
     if (maxValue <= 0 || value <= 0) {
       return chalk.dim('.'.repeat(CommandHandler.TOKEN_BAR_WIDTH));
@@ -4117,6 +5348,17 @@ export class CommandHandler {
     return Math.round(value).toLocaleString('en-US');
   }
 
+  private formatCompactTokenNumber(value: number): string {
+    const absolute = Math.abs(value);
+    if (absolute >= 1_000_000) {
+      return `${(value / 1_000_000).toFixed(absolute >= 10_000_000 ? 0 : 1)}M`;
+    }
+    if (absolute >= 1_000) {
+      return `${(value / 1_000).toFixed(absolute >= 100_000 ? 0 : 1)}k`;
+    }
+    return `${Math.round(value)}`;
+  }
+
   private async scanSkills(args: string[]): Promise<void> {
     const spinner = process.stdout.isTTY ? new Spinner() : null;
     if (spinner) {
@@ -4127,8 +5369,9 @@ export class CommandHandler {
 
     try {
       const requestedPath = args.join(' ').trim();
-      const targetPath = requestedPath ? path.resolve(process.cwd(), requestedPath) : process.cwd();
-      const scopeLabel = requestedPath ? path.relative(process.cwd(), targetPath) || '.' : 'current_project';
+      const resolvedTarget = await this.resolveSkillScanTarget(requestedPath);
+      const targetPath = resolvedTarget.targetPath;
+      const scopeLabel = resolvedTarget.scopeLabel;
       const targetStat = await fs.stat(targetPath);
       if (!targetStat.isDirectory()) {
         throw new Error(`Skills scan target is not a directory: ${targetPath}`);
@@ -4167,6 +5410,31 @@ export class CommandHandler {
       }
       this.recordCommandData('skills', `failed: ${message}`);
     }
+  }
+
+  private async resolveSkillScanTarget(requestedPath: string): Promise<{ targetPath: string; scopeLabel: string }> {
+    const normalized = requestedPath.trim().toLowerCase();
+    if (!normalized) {
+      return {
+        targetPath: process.cwd(),
+        scopeLabel: 'current_project',
+      };
+    }
+
+    if (normalized === 'cursor' || normalized === 'cursor-skills' || normalized === 'skills-cursor') {
+      const cursorSkillsPath =
+        (await this.resolveCursorDataDirectory('skills-cursor')) ?? path.join(os.homedir(), '.cursor', 'skills-cursor');
+      return {
+        targetPath: cursorSkillsPath,
+        scopeLabel: 'cursor_skills',
+      };
+    }
+
+    const targetPath = path.resolve(process.cwd(), requestedPath);
+    return {
+      targetPath,
+      scopeLabel: path.relative(process.cwd(), targetPath) || '.',
+    };
   }
 
   private async scanRules(args: string[]): Promise<void> {
@@ -5599,6 +6867,56 @@ export class CommandHandler {
     };
   }
 
+  private async resolveCursorTokenScanTarget(request: TokenScanRequest): Promise<TokenScanTarget> {
+    const projectsRoot = await this.resolveCursorDataDirectory('projects');
+    if (!projectsRoot || !(await this.pathExists(projectsRoot))) {
+      return {
+        source: 'cursor',
+        scopeLabel: request.scope === 'all' ? 'all_projects' : 'current_project',
+        sourceLabel: projectsRoot ?? path.join(os.homedir(), '.cursor', 'projects'),
+        projectDirs: [],
+        filePaths: [],
+      };
+    }
+
+    const projectDirs =
+      request.scope === 'all'
+        ? await this.listCursorProjectDirectories(projectsRoot)
+        : await this.resolveCursorProjectDirectories(projectsRoot, process.cwd());
+
+    const uniqueFiles = new Set<string>();
+    const filePaths: string[] = [];
+    const perProjectLimit =
+      request.scope === 'all'
+        ? CommandHandler.MAX_TOKEN_SCAN_FILES_PER_PROJECT_ALL
+        : CommandHandler.MAX_TOKEN_SCAN_FILES_PER_PROJECT;
+
+    for (const projectDir of projectDirs) {
+      const files = await this.listRecentCursorTranscriptFiles(projectDir, perProjectLimit);
+      for (const filePath of files) {
+        if (uniqueFiles.has(filePath)) {
+          continue;
+        }
+        uniqueFiles.add(filePath);
+        filePaths.push(filePath);
+        if (filePaths.length >= CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL) {
+          break;
+        }
+      }
+      if (filePaths.length >= CommandHandler.MAX_TOKEN_SCAN_FILES_TOTAL) {
+        break;
+      }
+    }
+
+    return {
+      source: 'cursor',
+      scopeLabel: request.scope === 'all' ? 'all_projects' : 'current_project',
+      sourceLabel: request.scope === 'all' ? projectsRoot : path.resolve(process.cwd()),
+      projectDirs,
+      filePaths,
+    };
+  }
+
   private async listRecentCodexRolloutFiles(rootPath: string, limit: number): Promise<string[]> {
     const queue = [rootPath];
     const files: Array<{ fullPath: string; mtimeMs: number }> = [];
@@ -5643,6 +6961,50 @@ export class CommandHandler {
       .map((item) => item.fullPath);
   }
 
+  private async listRecentCursorTranscriptFiles(projectDir: string, limit: number): Promise<string[]> {
+    const transcriptsRoot = path.join(projectDir, 'agent-transcripts');
+    const queue = [transcriptsRoot];
+    const files: Array<{ fullPath: string; mtimeMs: number }> = [];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current) {
+        continue;
+      }
+
+      let entries: Array<{ isDirectory(): boolean; isFile(): boolean; name: string }> = [];
+      try {
+        entries = await fs.readdir(current, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+
+      for (const entry of entries) {
+        const fullPath = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          queue.push(fullPath);
+          continue;
+        }
+
+        if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.jsonl')) {
+          continue;
+        }
+
+        try {
+          const stat = await fs.stat(fullPath);
+          files.push({ fullPath, mtimeMs: stat.mtimeMs });
+        } catch {
+          continue;
+        }
+      }
+    }
+
+    return files
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .slice(0, Math.max(1, limit))
+      .map((item) => item.fullPath);
+  }
+
   private async readCodexSessionCwd(filePath: string): Promise<string> {
     let raw = '';
     try {
@@ -5672,6 +7034,9 @@ export class CommandHandler {
     if (normalizedPath.includes('/.codex/sessions/') || normalizedPath.includes('/.codex/archived_sessions/')) {
       return 'codex';
     }
+    if (normalizedPath.includes('/.cursor/projects/') || normalizedPath.includes('/agent-transcripts/')) {
+      return 'cursor';
+    }
     if (normalizedPath.includes('/.claude/')) {
       return 'claude';
     }
@@ -5685,7 +7050,9 @@ export class CommandHandler {
 
     const probeFile = stat.isFile()
       ? inputPath
-      : (await this.listRecentCodexRolloutFiles(inputPath, 1))[0] ?? (await this.listRecentJsonlFiles(inputPath, 1))[0];
+      : (await this.listRecentCodexRolloutFiles(inputPath, 1))[0] ??
+        (await this.listRecentCursorTranscriptFiles(inputPath, 1))[0] ??
+        (await this.listRecentJsonlFiles(inputPath, 1))[0];
     if (!probeFile) {
       return fallback;
     }
@@ -5712,6 +7079,8 @@ export class CommandHandler {
     const topType = this.getStringAtPaths(parsed, [['type']])?.toLowerCase() ?? '';
     return topType === 'session_meta' || topType === 'turn_context' || topType === 'response_item' || topType === 'event_msg'
       ? 'codex'
+      : this.getStringAtPaths(parsed, [['role']]) && this.getValueAtPath(parsed, ['message', 'content']) !== null
+        ? 'cursor'
       : fallback;
   }
 
@@ -5789,6 +7158,43 @@ export class CommandHandler {
         .slice(-3);
       const tailHits = rootParts.filter((part) => normalizedEntry.includes(part)).length;
       score += tailHits * 5;
+
+      if (score > bestScore) {
+        bestScore = score;
+      }
+    }
+
+    return bestScore;
+  }
+
+  private normalizeCursorProjectKey(value: string): string {
+    return path
+      .resolve(value)
+      .replace(/\\/g, '/')
+      .replace(/:/g, '')
+      .replace(/[^a-z0-9]+/gi, '-')
+      .replace(/^-+|-+$/g, '')
+      .toLowerCase();
+  }
+
+  private scoreCursorProjectDirMatch(entryName: string, rootPath: string): number {
+    const normalizedEntry = this.normalizeCursorProjectKey(entryName);
+    const candidates = this.buildPathAncestors(rootPath).map((candidateRoot) => this.normalizeCursorProjectKey(candidateRoot));
+
+    if (candidates.includes(normalizedEntry)) {
+      return 100;
+    }
+
+    let bestScore = 0;
+    for (const candidate of candidates) {
+      let score = 0;
+      if (normalizedEntry.endsWith(candidate)) {
+        score += 60;
+      }
+
+      const candidateParts = candidate.split('-').filter(Boolean);
+      const matchedParts = candidateParts.filter((part) => normalizedEntry.includes(part)).length;
+      score += matchedParts * 6;
 
       if (score > bestScore) {
         bestScore = score;

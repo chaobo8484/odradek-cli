@@ -9,7 +9,8 @@
       "Bash(node test-models.js:*)",
       "Bash(cmd /c:*)",
       "Bash(\"C:\\\\Users\\\\ZhangChaobo\\\\Desktop\\\\aeris-cli\\\\src\\\\cli\\\\ContextNoiseAnalyzer.ts\")",
-      "Bash(npx tsc:*)"
+      "Bash(npx tsc:*)",
+      "Bash(find /c/Users/ZhangChaobo/Desktop/odradek-cli/src -name *.ts -o -name *.tsx)"
     ]
   }
 }

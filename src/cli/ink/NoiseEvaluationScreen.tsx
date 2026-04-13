@@ -13,7 +13,7 @@ import type {
 type NoiseEvaluationScreenProps = {
   scopeLabel: string;
   sourceLabel: string;
-  selectedSource: 'claude' | 'codex';
+  selectedSource: 'claude' | 'codex' | 'cursor';
   report: NoiseEvaluationReport;
 };
 

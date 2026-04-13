@@ -43,7 +43,7 @@ type ContextHealthSnapshot = {
 type ContextHealthScreenProps = {
   scopeLabel: string;
   sourceLabel: string;
-  selectedSource: 'claude' | 'codex';
+  selectedSource: 'claude' | 'codex' | 'cursor';
   snapshot: ContextHealthSnapshot;
 };
 

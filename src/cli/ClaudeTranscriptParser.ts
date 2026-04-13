@@ -1,8 +1,9 @@
 import { promises as fs } from 'fs';
 import path from 'path';
+import { countTokensBySource } from './tokenEstimateBySource.js';
 import { estimateTokenCount } from './tokenEstimate.js';
 
-export type TranscriptSource = 'claude' | 'codex';
+export type TranscriptSource = 'claude' | 'codex' | 'cursor';
 
 export type ClaudeTranscriptTarget = {
   sessionId: string;
@@ -166,11 +167,11 @@ export async function parseClaudeTranscriptSession(
   const source = resolveTranscriptSource(target);
   return source === 'codex'
     ? parseCodexTranscriptSession({ ...target, source })
-    : parseClaudeTranscriptSessionInternal({ ...target, source: 'claude' });
+    : parseClaudeTranscriptSessionInternal({ ...target, source });
 }
 
 async function parseClaudeTranscriptSessionInternal(
-  target: ClaudeTranscriptTarget & { source: 'claude' }
+  target: ClaudeTranscriptTarget & { source: 'claude' | 'cursor' }
 ): Promise<ClaudeTranscriptSession | null> {
   const raw = await readTextFile(target.filePath);
   if (raw === null) {
@@ -213,12 +214,12 @@ async function parseClaudeTranscriptSessionInternal(
         isCompactSummary,
         isSynthetic: isCompactSummary || isSyntheticMessagePayload(parsed),
       });
-      items.push({ order: index, tokenCount: estimateTokenCount(envelope.text) });
+      items.push({ order: index, tokenCount: await countTokensBySource(envelope.text, target.source || 'claude') });
     }
 
     for (const toolUse of envelope.toolUses) {
       const partial = buildObservationSeed(target, {
-        source: 'claude',
+        source: target.source,
         sourceToolName: toolUse.name,
         name: toolUse.name,
         id: toolUse.id,
@@ -243,7 +244,7 @@ async function parseClaudeTranscriptSessionInternal(
       observations.set(
         toolResult.toolUseId,
         buildObservationResult(target, existing, {
-          source: 'claude',
+          source: target.source,
           sourceToolName: existing?.sourceToolName ?? toolName,
           name: toolName,
           id: toolResult.toolUseId,
@@ -260,7 +261,7 @@ async function parseClaudeTranscriptSessionInternal(
     }
   }
 
-  return finalizeSession(target, { source: 'claude', model: 'unknown', contextWindowTokens: null }, {
+  return finalizeSession(target, { source: target.source, model: 'unknown', contextWindowTokens: null }, {
     cwdCounts,
     startTimestampMs,
     endTimestampMs,
@@ -355,7 +356,7 @@ async function parseCodexTranscriptSession(
         isCompactSummary: false,
         isSynthetic: false,
       });
-      items.push({ order: index, tokenCount: estimateTokenCount(text) });
+      items.push({ order: index, tokenCount: await countTokensBySource(text, target.source) });
       continue;
     }
 
@@ -631,6 +632,9 @@ function resolveTranscriptSource(target: ClaudeTranscriptTarget): TranscriptSour
     return target.source;
   }
   const normalizedPath = target.filePath.replace(/\\/g, '/').toLowerCase();
+  if (normalizedPath.includes('/.cursor/projects/') || normalizedPath.includes('/agent-transcripts/')) {
+    return 'cursor';
+  }
   return normalizedPath.includes('/.codex/sessions/') || normalizedPath.includes('/.codex/archived_sessions/')
     ? 'codex'
     : 'claude';

@@ -12,6 +12,10 @@
 
 </div>
 
+## Preface
+
+This project warmly welcomes Vibe Coding developers to join and contribute. Currently in its early stages, the project may have some imperfections. We sincerely invite everyone to contribute code, provide feedback, and help us improve it together.
+
 ## Overview
 
 Odradek is a CLI tool for **diagnosing and enhancing Claude Code, Codex, and similar AI coding Agents**. It enables you to:
@@ -37,7 +41,8 @@ Odradek is a CLI tool for **diagnosing and enhancing Claude Code, Codex, and sim
 | **Prompt Asset Scanning** | Auto-scan prompt files, rules, agent configs, and system-prompt assets in workspaces |
 | **Skill Documentation Inventory** | Scan `SKILL.md` and supporting resources (agents/scripts/references) with instruction token estimates |
 | **Project Context Injection** | Intelligently index workspace files and dynamically inject relevant context based on LLM queries |
-| **JSON Diagnostic Export** | Export diagnostic data (noise_eval / context_health / scan_tokens) to JSON for secondary analysis |
+| **JSON Diagnostic Export** | Export diagnostic data (noise_eval / context_health / scan_tokens and related diagnostics) to JSON for secondary analysis |
+| **Cost Estimation** | Real-time cost estimation for Claude/Codex models based on OpenRouter pricing, with visual breakdowns and scenario modeling |
 
 ## Preview
 
@@ -60,7 +65,8 @@ Odradek is a CLI tool for **diagnosing and enhancing Claude Code, Codex, and sim
 | --- | --- | --- |
 | **Runtime Control** | Active provider, model overrides, trust state, project-context toggle | `/state`, `/provider`, `/model`, `/trustpath`, `/trustcheck`, `/projectcontext` |
 | **Prompt and Rule Inspection** | Prompt assets, workspace rules, `SKILL.md` inventory | `/scan_prompt`, `/rules`, `/skills` |
-| **Session Diagnostics** | Token structure, context health, Evidence-first noise evaluation, todo granularity | `/scan_tokens`, `/context_health`, `/noise_eval`, `/todo_granularity` |
+| **Session Diagnostics** | Token structure, daily token usage, context health, Evidence-first noise evaluation, todo granularity | `/scan_tokens`, `/token_usage`, `/context_health`, `/noise_eval`, `/todo_granularity` |
+| **Cost Estimation** | Real-time cost estimation for Claude/Codex models with visual breakdowns and scenario modeling | `/cost` |
 | **Conversation Utilities** | History, collapse/expand, clear, export | `/history`, `/collapse`, `/expand`, `/clear`, `/export` |
 
 ## Requirements
@@ -94,6 +100,7 @@ npx odradek-cli@latest
 /state                    # Check runtime status
 /provider                 # Confirm current provider
 /scan_tokens codex current  # Parse session token structure
+/token_usage codex current  # Aggregate daily token usage by model
 /noise_eval codex current   # Run Evidence-first noise evaluation
 ```
 
@@ -234,6 +241,7 @@ These commands support the source prefix `claude` or `codex`:
 | Command | Description |
 | --- | --- |
 | `/scan_tokens [claude\|codex] [current\|all\|path]` | Parse session JSONL token structures |
+| `/token_usage [claude\|codex\|cursor] [current\|all\|path]` | Aggregate daily token usage by model |
 | `/context_health [claude\|codex] [current\|all\|path]` | Inspect context-window health |
 | `/noise_eval [claude\|codex] [current\|all\|path]` | Run evidence-first noise evaluation |
 | `/context_noise [claude\|codex] [current\|all\|path]` | Alias for `/noise_eval` |
@@ -243,10 +251,32 @@ Useful examples:
 
 ```text
 /scan_tokens codex current
+/token_usage codex current
 /context_health codex all
 /noise_eval claude current
 /todo_granularity codex current
 ```
+
+### Cost estimation
+
+| Command | Description |
+| --- | --- |
+| `/cost [claude\|codex]` | Estimate costs for Claude or Codex/GPT models based on OpenRouter pricing |
+
+The `/cost` command provides real-time cost estimation by:
+- Fetching live pricing data from OpenRouter's model catalog
+- Scanning the current workspace prompt assets to calculate total input tokens
+- Modeling multiple cost scenarios (cold start, cache hits, combined with output)
+- Displaying visual breakdowns of cache-eligible vs dynamic tokens
+
+Useful examples:
+
+```text
+/cost claude    # Estimate costs for Claude family models
+/cost codex     # Estimate costs for Codex/GPT family models
+```
+
+> **Note**: `/cost cursor` is intentionally not supported as Cursor model pricing is not publicly available.
 
 ### Conversation and export
 

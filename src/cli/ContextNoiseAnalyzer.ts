@@ -771,7 +771,7 @@ export class ContextNoiseAnalyzer {
     const matched = new Set<string>();
     for (const next of futureObservations) {
       const nextPath = this.normalizePathKey(next.targetPath);
-      if (nextPath && nextPath.startsWith(`${baseDirectory}\\`)) {
+      if (nextPath && this.isPathWithinDirectory(nextPath, baseDirectory)) {
         matched.add(nextPath);
       }
     }
@@ -795,7 +795,7 @@ export class ContextNoiseAnalyzer {
     }
     return futureObservations.some((next) => {
       const nextPath = this.normalizePathKey(next.targetPath);
-      return nextPath ? nextPath.startsWith(`${baseDirectory}\\`) : false;
+      return nextPath ? this.isPathWithinDirectory(nextPath, baseDirectory) : false;
     });
   }
 
@@ -808,6 +808,22 @@ export class ContextNoiseAnalyzer {
       return normalizedPath;
     }
     return this.normalizePathKey(path.dirname(observation.targetPath));
+  }
+
+  private isPathWithinDirectory(candidatePath: string, directoryPath: string): boolean {
+    const normalizedCandidate = this.normalizePathKey(candidatePath);
+    const normalizedDirectory = this.normalizePathKey(directoryPath);
+    if (!normalizedCandidate || !normalizedDirectory || normalizedCandidate === normalizedDirectory) {
+      return false;
+    }
+
+    const candidateSegments = normalizedCandidate.split(/[\\/]+/).filter(Boolean);
+    const directorySegments = normalizedDirectory.split(/[\\/]+/).filter(Boolean);
+    if (candidateSegments.length <= directorySegments.length) {
+      return false;
+    }
+
+    return directorySegments.every((segment, index) => candidateSegments[index] === segment);
   }
 
   private looksLikeDirectoryPath(candidatePath: string): boolean {

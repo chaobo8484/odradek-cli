@@ -1,12 +1,25 @@
 import chalk from 'chalk';
+import spinners from 'unicode-animations';
+import type { BrailleSpinnerName } from 'unicode-animations';
 
 export class Spinner {
-  private frames = ['-', '\\', '|', '/'];
+  private static readonly FALLBACK_FRAMES = ['-', '\\', '|', '/'];
+  private readonly frames: readonly string[];
+  private readonly frameInterval: number;
   private readonly frameColor = chalk.hex('#D6F54A');
   private currentFrame = 0;
   private interval: NodeJS.Timeout | null = null;
   private message = '';
   private startedAt = 0;
+
+  constructor(animationName: BrailleSpinnerName = 'cascade') {
+    const animation = spinners[animationName];
+    this.frames =
+      animation && Array.isArray(animation.frames) && animation.frames.length > 0
+        ? animation.frames
+        : Spinner.FALLBACK_FRAMES;
+    this.frameInterval = animation && animation.interval > 0 ? animation.interval : 80;
+  }
 
   start(message: string): void {
     this.message = message;
@@ -18,7 +31,7 @@ export class Spinner {
     this.interval = setInterval(() => {
       this.render();
       this.currentFrame = (this.currentFrame + 1) % this.frames.length;
-    }, 80);
+    }, this.frameInterval);
   }
 
   stop(finalMessage?: string): void {

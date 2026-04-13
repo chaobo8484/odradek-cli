@@ -21,6 +21,13 @@ import { LLMAdapter } from '../llm/adapters/types.js';
 import { TrustDecision, TrustPrompt } from './ink/TrustPrompt.js';
 import { UpdateChecker, UpdateNotice } from './UpdateChecker.js';
 
+type DetailPageContext = {
+  command: string;
+  dialogueTurns: number;
+};
+
+type DetailNavigationMode = 'push' | 'replace' | 'preserve';
+
 export class CLI {
   private static readonly EXIT_CONFIRM_WINDOW_MS = 3000;
   private conversationManager: ConversationManager;
@@ -57,7 +64,7 @@ export class CLI {
   private pendingExitConfirmationUntil = 0;
   private pendingExitConfirmationTimer: ReturnType<typeof setTimeout> | null = null;
   private exitConfirmationNoticeVisible = false;
-  private activeDetailPageContext: { command: string; dialogueTurns: number } | null = null;
+  private detailPageStack: DetailPageContext[] = [];
   private isReturningFromDetailPage = false;
   private currentUpdateNotice: UpdateNotice | null = null;
   private readonly onInputAssistKeypress = (str: string, key: readline.Key): void => {
@@ -179,7 +186,10 @@ export class CLI {
       this.recordCommandData.bind(this),
       this.handleProjectContextCommand.bind(this),
       this.trustCurrentPath.bind(this),
-      this.checkCurrentPathTrust.bind(this)
+      this.checkCurrentPathTrust.bind(this),
+      this.navigateBack.bind(this),
+      this.navigateHome.bind(this),
+      this.openCommandMenu.bind(this)
     );
   }
 
@@ -223,7 +233,7 @@ export class CLI {
     this.inlineSuggestionLines = 0;
     this.lastInlineSuggestionQuery = '';
     this.promptVisibleLines = 0;
-    this.activeDetailPageContext = null;
+    this.detailPageStack = [];
 
     const windowWidth = this.getHomeWindowWidth();
     const panelContentWidth = Math.max(30, windowWidth - 4);
@@ -623,6 +633,7 @@ export class CLI {
     try {
       const claudeCodeActive = this.hasUserWorkspaceToolingDirectory('.claude');
       const codexActive = this.hasUserWorkspaceToolingDirectory('.codex');
+      const cursorActive = this.hasUserWorkspaceToolingDirectory('.cursor');
       return [
         ...this.formatHomeParallelKeyValueLines(
           {
@@ -637,10 +648,12 @@ export class CLI {
           },
           width
         ),
+        this.formatHomeKeyValueLine('Cursor', cursorActive ? 'active' : 'not active', width, cursorActive ? 'success' : 'muted'),
       ];
     } catch {
       const claudeCodeActive = this.hasUserWorkspaceToolingDirectory('.claude');
       const codexActive = this.hasUserWorkspaceToolingDirectory('.codex');
+      const cursorActive = this.hasUserWorkspaceToolingDirectory('.cursor');
       return [
         ...this.formatHomeParallelKeyValueLines(
           {
@@ -655,6 +668,7 @@ export class CLI {
           },
           width
         ),
+        this.formatHomeKeyValueLine('Cursor', cursorActive ? 'active' : 'not active', width, cursorActive ? 'success' : 'muted'),
       ];
     }
   }
@@ -728,7 +742,7 @@ export class CLI {
     }
   }
 
-  private hasUserWorkspaceToolingDirectory(directoryName: '.claude' | '.codex'): boolean {
+  private hasUserWorkspaceToolingDirectory(directoryName: '.claude' | '.codex' | '.cursor'): boolean {
     try {
       return fs.existsSync(path.join(os.homedir(), directoryName));
     } catch {
@@ -960,8 +974,10 @@ export class CLI {
       return `  ${this.truncateAnsiLine(chalk.yellow('Press Ctrl+C again within 3 seconds to exit.'), columns - 2)}`;
     }
 
-    if (this.activeDetailPageContext) {
-      return `  ${this.truncateAnsiLine(chalk.dim(`Ctrl+C back to home · ${this.formatDetailPageHistoryLabel(this.activeDetailPageContext)}`), columns - 2)}`;
+    const activeDetailPageContext = this.getCurrentDetailPageContext();
+    if (activeDetailPageContext) {
+      const backLabel = this.detailPageStack.length > 1 ? 'previous page' : 'home';
+      return `  ${this.truncateAnsiLine(chalk.dim(`Ctrl+C back to ${backLabel} · /back · /home · ${this.formatDetailPageHistoryLabel(activeDetailPageContext)}`), columns - 2)}`;
     }
 
     if (this.getCurrentReadlineInput().trimStart().startsWith('/')) {
@@ -1180,27 +1196,11 @@ export class CLI {
     this.lastInlineSuggestionQuery = '';
 
     if (input.startsWith('/')) {
-      const normalizedCommand = input.slice(1).trim().split(/\s+/)[0]?.toLowerCase() || 'unknown';
-      const canonicalCommand = this.commandRegistry.getCommand(normalizedCommand)?.name ?? normalizedCommand;
-      const safeInput = this.maskSensitiveCommandInput(input);
-      this.recordCommandData(normalizedCommand, `invoked ${safeInput}`);
-      this.uiRenderer.renderCommandInvocation(safeInput);
-      await this.commandHandler.handleCommand(input);
-      if (this.isDetailPageCommand(canonicalCommand)) {
-        this.activeDetailPageContext = { command: safeInput, dialogueTurns: 0 };
-      }
-      if (normalizedCommand === 'clear') {
-        this.commandDataHistory = [];
-      }
+      await this.runSlashCommand(input);
       return;
     }
 
-    if (this.activeDetailPageContext) {
-      this.activeDetailPageContext = {
-        ...this.activeDetailPageContext,
-        dialogueTurns: this.activeDetailPageContext.dialogueTurns + 1,
-      };
-    }
+    this.incrementActiveDetailDialogueTurns();
 
     this.conversationManager.addMessage('user', input);
     this.uiRenderer.renderLastMessage();
@@ -1245,6 +1245,39 @@ export class CLI {
     return input;
   }
 
+  private async runSlashCommand(
+    input: string,
+    options?: {
+      navigationMode?: DetailNavigationMode;
+      recordInvocation?: boolean;
+      renderInvocation?: boolean;
+    }
+  ): Promise<void> {
+    const normalizedCommand = input.slice(1).trim().split(/\s+/)[0]?.toLowerCase() || 'unknown';
+    const resolution = this.commandRegistry.resolveCommand(normalizedCommand);
+    const canonicalCommand = resolution.status === 'exact' || resolution.status === 'prefix' ? resolution.command.name : normalizedCommand;
+    const safeInput = this.maskSensitiveCommandInput(input);
+    const shouldRecordInvocation = options?.recordInvocation ?? true;
+    const shouldRenderInvocation = options?.renderInvocation ?? true;
+
+    if (shouldRecordInvocation) {
+      this.recordCommandData(normalizedCommand, `invoked ${safeInput}`);
+    }
+    if (shouldRenderInvocation) {
+      this.uiRenderer.renderCommandInvocation(safeInput);
+    }
+
+    await this.commandHandler.handleCommand(input);
+
+    if (this.isDetailPageCommand(canonicalCommand)) {
+      this.updateDetailPageStack(safeInput, options?.navigationMode ?? 'push');
+    }
+
+    if (canonicalCommand === 'clear') {
+      this.commandDataHistory = [];
+    }
+  }
+
   private recordCommandData(command: string, data: string): void {
     const normalizedCommand = command.trim().toLowerCase() || 'unknown';
     const normalizedData = data.replace(/\r\n/g, '\n').trim();
@@ -1266,6 +1299,42 @@ export class CLI {
     if (this.commandDataHistory.length > maxEntries) {
       this.commandDataHistory = this.commandDataHistory.slice(this.commandDataHistory.length - maxEntries);
     }
+  }
+
+  private getCurrentDetailPageContext(): DetailPageContext | null {
+    return this.detailPageStack[this.detailPageStack.length - 1] ?? null;
+  }
+
+  private updateDetailPageStack(command: string, navigationMode: DetailNavigationMode): void {
+    if (navigationMode === 'preserve') {
+      return;
+    }
+
+    if (navigationMode === 'replace' && this.detailPageStack.length > 0) {
+      this.detailPageStack[this.detailPageStack.length - 1] = { command, dialogueTurns: 0 };
+      return;
+    }
+
+    const current = this.getCurrentDetailPageContext();
+    if (current?.command === command) {
+      current.dialogueTurns = 0;
+      return;
+    }
+
+    this.detailPageStack.push({ command, dialogueTurns: 0 });
+    const maxDepth = 8;
+    if (this.detailPageStack.length > maxDepth) {
+      this.detailPageStack = this.detailPageStack.slice(this.detailPageStack.length - maxDepth);
+    }
+  }
+
+  private incrementActiveDetailDialogueTurns(): void {
+    const current = this.getCurrentDetailPageContext();
+    if (!current) {
+      return;
+    }
+
+    current.dialogueTurns += 1;
   }
 
   private buildCommandDataContext(): string {
@@ -1559,6 +1628,162 @@ export class CLI {
     this.recordCommandData('projectcontext', 'Usage: /projectcontext [on|off|status]');
   }
 
+  private async openCommandMenu(): Promise<void> {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      this.uiRenderer.renderError('Interactive command menu requires a TTY. Use /help instead.');
+      this.recordCommandData('menu', 'failed: interactive command menu requires a TTY');
+      return;
+    }
+
+    this.isInteractiveCommandActive = true;
+    this.clearSuggestions();
+
+    try {
+      let selectedCommand: string | null = null;
+
+      while (!selectedCommand) {
+        const { section } = await inquirer.prompt<{ section: string }>([
+          {
+            type: 'list',
+            name: 'section',
+            message: this.getCommandMenuMessage(),
+            choices: [
+              { name: 'Workspace diagnostics', value: 'workspace' },
+              { name: 'Session tools', value: 'session' },
+              { name: 'Runtime settings', value: 'configuration' },
+              { name: 'Navigation', value: 'navigation' },
+              { name: 'Close menu', value: 'cancel' },
+            ],
+          },
+        ]);
+
+        if (section === 'cancel') {
+          this.uiRenderer.renderCommandResult('Menu closed');
+          this.recordCommandData('menu', 'closed');
+          return;
+        }
+
+        if (section === 'workspace') {
+          selectedCommand = await this.promptCommandMenuSection('Workspace diagnostics', [
+            { name: '/state  Project and runtime overview', value: '/state' },
+            { name: '/skills  Scan local SKILL.md files', value: '/skills' },
+            { name: '/scan_prompt  Scan prompt and rules assets', value: '/scan_prompt' },
+            { name: '/rules  Detect explicit workspace rules', value: '/rules' },
+            { name: '/scan_tokens  Parse session token structures', value: '/scan_tokens' },
+            { name: '/token_usage  Aggregate daily token usage by model', value: '/token_usage' },
+            { name: '/cost  Estimate current request cost', value: '/cost' },
+            { name: '/context_health  Check context window health', value: '/context_health' },
+            { name: '/noise_eval  Run noise evaluation', value: '/noise_eval' },
+            { name: '/todo_granularity  Analyze todo granularity', value: '/todo_granularity' },
+          ]);
+          continue;
+        }
+
+        if (section === 'session') {
+          selectedCommand = await this.promptCommandMenuSection('Session tools', [
+            { name: '/history  Show full conversation history', value: '/history' },
+            { name: '/analyze  Analyze the current conversation', value: '/analyze' },
+            { name: '/clear  Clear conversation history', value: '/clear' },
+            { name: '/collapse all  Collapse all messages', value: '/collapse all' },
+            { name: '/expand all  Expand all messages', value: '/expand all' },
+            { name: '/export codex all  Export all diagnostics', value: '/export codex all' },
+          ]);
+          continue;
+        }
+
+        if (section === 'configuration') {
+          selectedCommand = await this.promptCommandMenuSection('Runtime settings', [
+            { name: '/provider  Switch active provider', value: '/provider' },
+            { name: '/model  Switch active model', value: '/model' },
+            { name: '/projectcontext status  Check project context', value: '/projectcontext status' },
+            { name: '/projectcontext on  Enable project context', value: '/projectcontext on' },
+            { name: '/projectcontext off  Disable project context', value: '/projectcontext off' },
+            { name: '/trustcheck  Check workspace trust', value: '/trustcheck' },
+            { name: '/trustpath  Trust current workspace', value: '/trustpath' },
+          ]);
+          continue;
+        }
+
+        selectedCommand = await this.promptCommandMenuSection('Navigation', [
+          { name: '/back  Return to previous detail page', value: '/back' },
+          { name: '/home  Return to home screen', value: '/home' },
+          { name: '/help  Show grouped command help', value: '/help' },
+          { name: '/exit  Exit the CLI', value: '/exit' },
+        ]);
+      }
+
+      if (selectedCommand === '__cancel') {
+        this.uiRenderer.renderCommandResult('Menu closed');
+        this.recordCommandData('menu', 'closed');
+        return;
+      }
+
+      this.recordCommandData('menu', `selected ${selectedCommand}`);
+      this.resetTerminalView();
+
+      if (selectedCommand === '/back') {
+        await this.navigateBack();
+        return;
+      }
+
+      if (selectedCommand === '/home') {
+        await this.navigateHome();
+        return;
+      }
+
+      await this.runSlashCommand(selectedCommand, { recordInvocation: false, renderInvocation: true });
+    } catch (error) {
+      if (this.isPromptCancelError(error)) {
+        this.uiRenderer.renderCommandResult('Menu closed');
+        this.recordCommandData('menu', 'closed');
+        return;
+      }
+
+      const message = error instanceof Error ? error.message : 'Failed to open command menu';
+      this.uiRenderer.renderError(message);
+      this.recordCommandData('menu', `failed: ${message}`);
+    } finally {
+      this.isInteractiveCommandActive = false;
+      this.autoCompleter.resetSuggestions();
+      this.applyBlockCursorStyle();
+      this.ensureInputReadyAfterConfig();
+    }
+  }
+
+  private async promptCommandMenuSection(
+    title: string,
+    choices: Array<{ name: string; value: string }>
+  ): Promise<string | null> {
+    const { selectedCommand } = await inquirer.prompt<{ selectedCommand: string }>([
+      {
+        type: 'list',
+        name: 'selectedCommand',
+        message: `${title} · select an action`,
+        choices: [...choices, { name: 'Back', value: '__back' }, { name: 'Close menu', value: '__cancel' }],
+        pageSize: Math.min(12, choices.length + 2),
+      },
+    ]);
+
+    if (selectedCommand === '__back') {
+      return null;
+    }
+
+    if (selectedCommand === '__cancel') {
+      return '__cancel';
+    }
+
+    return selectedCommand;
+  }
+
+  private getCommandMenuMessage(): string {
+    const current = this.getCurrentDetailPageContext();
+    if (!current) {
+      return 'Command menu · choose a section';
+    }
+
+    return `Command menu · current page: ${current.command}`;
+  }
+
   private async fetchAvailableModels(provider: ProviderName, baseUrl: string, apiKey: string): Promise<string[]> {
     const normalizedBase = baseUrl.replace(/\/+$/, '');
 
@@ -1735,8 +1960,8 @@ export class CLI {
   }
 
   private async handleSigint(): Promise<void> {
-    if (this.activeDetailPageContext && !this.isLineProcessing && !this.isInteractiveCommandActive) {
-      await this.returnToWelcomeFromDetailPage();
+    if (this.detailPageStack.length > 0 && !this.isLineProcessing && !this.isInteractiveCommandActive) {
+      await this.navigateBack();
       return;
     }
 
@@ -1770,6 +1995,8 @@ export class CLI {
       'scan_prompt',
       'rules',
       'scan_tokens',
+      'token_usage',
+      'cost',
       'context_health',
       'noise_eval',
       'context_noise',
@@ -1777,13 +2004,30 @@ export class CLI {
     ]).has(commandName);
   }
 
-  private async returnToWelcomeFromDetailPage(): Promise<void> {
+  private async navigateBack(): Promise<void> {
+    if (this.detailPageStack.length === 0) {
+      this.uiRenderer.renderInfo('Already at home. Use /menu or /help to open commands.');
+      this.recordCommandData('back', 'Already at home');
+      return;
+    }
+
+    if (this.detailPageStack.length === 1) {
+      await this.navigateHome();
+      this.recordCommandData('back', 'Returned to home');
+      return;
+    }
+
+    await this.returnToPreviousDetailPage();
+    this.recordCommandData('back', `Returned to ${this.getCurrentDetailPageContext()?.command ?? 'previous page'}`);
+  }
+
+  private async navigateHome(): Promise<void> {
     if (this.isReturningFromDetailPage) {
       return;
     }
 
     this.isReturningFromDetailPage = true;
-    const detailContext = this.activeDetailPageContext;
+    const detailContext = this.getCurrentDetailPageContext();
     this.clearPendingExitConfirmation(true);
     this.clearSuggestions();
     this.setReadlineInput('');
@@ -1801,8 +2045,42 @@ export class CLI {
     }
   }
 
-  private formatDetailPageHistoryLabel(context: { command: string; dialogueTurns: number }): string {
-    return `${context.command} · ${context.dialogueTurns} dialogues`;
+  private async returnToPreviousDetailPage(): Promise<void> {
+    if (this.isReturningFromDetailPage || this.detailPageStack.length <= 1) {
+      return;
+    }
+
+    this.isReturningFromDetailPage = true;
+    const current = this.detailPageStack.pop();
+    const previous = this.getCurrentDetailPageContext();
+    this.clearPendingExitConfirmation(true);
+    this.clearSuggestions();
+    this.setReadlineInput('');
+    this.clearPromptEchoBlock();
+
+    try {
+      this.resetTerminalView();
+      if (previous) {
+        await this.runSlashCommand(previous.command, {
+          navigationMode: 'preserve',
+          recordInvocation: false,
+          renderInvocation: true,
+        });
+        if (current) {
+          this.uiRenderer.renderCommandResult(`Back: ${current.command} -> ${previous.command}`);
+        }
+      } else {
+        await this.showWelcome();
+      }
+      this.showPrompt();
+    } finally {
+      this.isReturningFromDetailPage = false;
+    }
+  }
+
+  private formatDetailPageHistoryLabel(context: DetailPageContext): string {
+    const depthLabel = this.detailPageStack.length > 1 ? ` · depth ${this.detailPageStack.length}` : '';
+    return `${context.command} · ${context.dialogueTurns} dialogues${depthLabel}`;
   }
 
   private hasPendingExitConfirmation(): boolean {
